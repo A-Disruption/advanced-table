@@ -61,11 +61,11 @@ pub mod table;
 
 pub use header::{group, leaf, ColumnSpec, HeaderNode};
 pub use scroll::Policy;
-pub use selection::Mode as SelectionMode;
+pub use selection::{CellPosition, Mode as SelectionMode};
 pub use sizing::{Overflow, Sizing};
 pub use sort::{Direction, Sort};
 pub use style::{Catalog, Cell, CellStyle, Style};
-pub use table::DataTable;
+pub use table::{Click, DataTable};
 
 /// Convenience constructor mirroring iced's `fn`-style widget helpers.
 pub fn data_table<'a, Message: 'a, Theme, Renderer>(

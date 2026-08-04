@@ -28,6 +28,12 @@ pub struct Style {
     pub hovered_row_background: Option<Background>,
     /// Vertical band drawn over a selected column, in both header and body.
     pub selected_column_background: Option<Background>,
+    /// Fill for the selected cell. Drawn above every row and column highlight,
+    /// since a cell is the most specific thing the grid can point at.
+    pub selected_cell_background: Option<Background>,
+    /// Outline for the selected cell, on all four sides. The fill alone is easy
+    /// to lose against a selected row or column band underneath it.
+    pub selected_cell_border: Option<Color>,
     /// Drawn around the outside of the whole widget, on top of everything else
     /// so no band or stripe can paint over it.
     ///
@@ -42,6 +48,11 @@ pub struct Style {
     /// of the header. Making this heavier than `column_divider` is what reads
     /// as "these columns belong together" rather than as one flat grid.
     pub group_divider: Option<Color>,
+    /// Vertical rule along the seam between frozen and scrolling columns, run
+    /// the full height of the table over both. Make it the heaviest rule in the
+    /// style -- it separates two things that move independently, which is a
+    /// stronger boundary than any of the others.
+    pub frozen_divider: Option<Color>,
     /// Vertical rule closing the gutter off from the columns, at both edges and
     /// running the full height of the table. Without it the gutter reads as
     /// slack space outside the table rather than as part of it.
@@ -171,6 +182,11 @@ pub fn default(theme: &Theme) -> Style {
             a: 0.18,
             ..palette.primary.base.color
         })),
+        selected_cell_background: Some(Background::Color(Color {
+            a: 0.28,
+            ..palette.primary.base.color
+        })),
+        selected_cell_border: Some(palette.primary.base.color),
         border: Border {
             color: palette.background.strongest.color,
             width: 1.0,
@@ -181,6 +197,7 @@ pub fn default(theme: &Theme) -> Style {
         // is a stronger statement than a column boundary, and drawing both at
         // the same weight is what flattens a three-level header into a grid.
         group_divider: Some(palette.background.strongest.color),
+        frozen_divider: Some(palette.background.strongest.color),
         gutter_divider: Some(palette.background.strong.color),
         row_divider: Some(palette.background.strong.color),
         header_divider: Some(palette.background.strongest.color),
@@ -222,9 +239,15 @@ pub fn minimal(theme: &Theme) -> Style {
             a: 0.12,
             ..palette.primary.base.color
         })),
+        selected_cell_background: Some(Background::Color(Color {
+            a: 0.2,
+            ..palette.primary.base.color
+        })),
+        selected_cell_border: Some(palette.primary.base.color),
         border: Border::default(),
         column_divider: None,
         group_divider: Some(palette.background.weak.color),
+        frozen_divider: Some(palette.background.strong.color),
         gutter_divider: Some(palette.background.weak.color),
         row_divider: Some(palette.background.weak.color),
         header_divider: Some(palette.background.strong.color),

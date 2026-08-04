@@ -31,6 +31,25 @@ pub enum Mode {
     Multiple,
 }
 
+/// One cell, by position, in the same leaf-column coordinates the `rows` view
+/// function and [`Click`](crate::Click) use.
+///
+/// Single cell rather than a set: a cell selection that spans a range is a
+/// *rectangle*, not a list, and the set-plus-anchor machinery rows use does not
+/// describe one. Ranges can be added later without breaking this, since a
+/// single cell is the degenerate rectangle.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+pub struct CellPosition {
+    pub row: usize,
+    pub column: usize,
+}
+
+impl CellPosition {
+    pub fn new(row: usize, column: usize) -> Self {
+        Self { row, column }
+    }
+}
+
 /// What a click should produce.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Outcome {

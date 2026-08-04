@@ -47,7 +47,7 @@ use iced::{
 
 use crate::header::{self, ColumnSpec, HeaderCell, HeaderNode};
 use crate::scroll::{self, Policy};
-use crate::selection::{self, Mode};
+use crate::selection::{self, CellPosition, Mode};
 use crate::sizing::{self, Overflow, Sizing, SpanRequest};
 use crate::sort::{self, Direction, Sort};
 use crate::style::{Catalog, Cell, CellStyle, Style};
@@ -55,12 +55,20 @@ use crate::style::{Catalog, Cell, CellStyle, Style};
 /// Fallback scroll step when a wheel reports lines and rows are tiny.
 const MIN_WHEEL_STEP: f32 = 16.0;
 
-/// Width reserved at the trailing end of a sortable leaf header for its sort
-/// control, and the click target for it.
+/// Width of the sort control at the trailing end of a sortable leaf header.
+/// Doubles as its click target, so it is wider than the arrows inside it.
 const SORT_ZONE: f32 = 16.0;
 
-/// Width of the arrow drawn inside that zone.
+/// Width of the arrows drawn inside that zone.
 const SORT_ARROW: f32 = 8.0;
+
+/// Clear space between a header's label and its sort control.
+///
+/// Reserved on top of `SORT_ZONE` rather than taken out of it, so the gap does
+/// not eat the click target. It only shows up on labels that reach the control
+/// -- a right-aligned header like "Revenue", or any header whose text fills the
+/// column -- which is why widening the column never opened the gap on its own.
+const SORT_GAP: f32 = 5.0;
 
 pub struct DataTable<'a, Message, Theme, Renderer>
 where
@@ -77,6 +85,7 @@ where
     header_rows: usize,
     columns: Vec<ColumnSpec>,
     row_count: usize,
+    sticky_columns: usize,
 
     spacing: f32,
     padding: Padding,
@@ -98,6 +107,11 @@ where
 
     sort: Option<Sort>,
     on_sort: Option<Box<dyn Fn(Option<Sort>) -> Message + 'a>>,
+
+    on_right_click: Option<Box<dyn Fn(Click) -> Message + 'a>>,
+
+    selected_cell: Option<CellPosition>,
+    on_select_cell: Option<Box<dyn Fn(Option<CellPosition>) -> Message + 'a>>,
 
     /// Blank strip at the left and right edges, inside the widget but outside
     /// every column.
@@ -126,6 +140,10 @@ struct State {
     header_row_height: f32,
     header_height: f32,
     row_height: f32,
+    /// Content-space x at which the frozen columns end. Zero when none are
+    /// sticky, which makes every frozen-aware calculation collapse back to the
+    /// plain one.
+    frozen_width: f32,
     /// Full extent of the body content, excluding the header.
     content: Size,
 
@@ -134,6 +152,12 @@ struct State {
     /// Grab point within the thumb while dragging, per axis.
     y_grab: Option<f32>,
     x_grab: Option<f32>,
+
+    /// Widest content ever measured per column, and the row count that
+    /// measurement belongs to. Together they keep column widths from twitching
+    /// when the same rows are merely reordered.
+    measured: Vec<f32>,
+    measured_rows: usize,
 
     /// Per-column widths the user has dragged to. `None` means "follow the
     /// declared sizing policy".
@@ -154,6 +178,32 @@ struct State {
     hovered: Option<usize>,
     /// Leaf column whose sort control the pointer is over.
     hovered_sort: Option<usize>,
+}
+
+/// Where a click landed, in table terms rather than pixels.
+///
+/// Both coordinates are optional because both can genuinely miss: the header
+/// has no row, and the gutters belong to no column. A context menu usually
+/// wants to offer different items for each case, so the distinction is kept
+/// rather than collapsed to a "nearest" guess.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct Click {
+    /// Body row, or `None` in the header.
+    pub row: Option<usize>,
+    /// Leaf column, or `None` in a gutter.
+    pub column: Option<usize>,
+    /// Screen position, for placing a menu at the pointer.
+    pub position: Point,
+}
+
+/// The one thing a click resolves to. Rows, columns and cells are three
+/// readings of the same grid, so a click picks exactly one and the other two
+/// are cleared.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Target {
+    Cell(CellPosition),
+    Row(usize),
+    Column(usize),
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -179,6 +229,7 @@ where
             header_rows: flat.rows,
             columns: flat.columns,
             row_count: 0,
+            sticky_columns: flat.sticky_columns,
             spacing: 0.0,
             padding: Padding::from([6, 10]),
             overflow: Overflow::default(),
@@ -195,6 +246,9 @@ where
             on_select_column: None,
             sort: None,
             on_sort: None,
+            on_right_click: None,
+            selected_cell: None,
+            on_select_cell: None,
             gutter: 8.0,
             resizable: true,
             resize_tolerance: 4.0,
@@ -351,6 +405,45 @@ where
         self
     }
 
+    /// Enable single-cell selection.
+    ///
+    /// Turning this on **changes what a body click means**: a click inside any
+    /// column now selects that cell, and the [`gutter`](Self::gutter) becomes
+    /// the only place a click still means "this row". That is the whole reason
+    /// the gutter exists -- without it, enabling cell selection would leave row
+    /// selection with nowhere to live, because every pixel of a row is owned by
+    /// some column.
+    ///
+    /// Cell, row and column selections are mutually exclusive: they are three
+    /// readings of the same grid, and holding two at once leaves no way to tell
+    /// which one an action would apply to. Selecting a cell therefore clears
+    /// the other two, and they clear it.
+    ///
+    /// Same ownership rule as everything else here -- you hold the selection,
+    /// the widget renders it and reports what it should become.
+    pub fn cell_selection(
+        mut self,
+        selected: Option<CellPosition>,
+        on_select: impl Fn(Option<CellPosition>) -> Message + 'a,
+    ) -> Self {
+        self.selected_cell = selected;
+        self.on_select_cell = Some(Box::new(on_select));
+        self
+    }
+
+    /// Report right-clicks, with the cell they landed on.
+    ///
+    /// The table does not open a menu -- it tells you where the click was and
+    /// leaves the menu to you. Anything else would mean the widget owning a
+    /// list of actions it cannot know, and a popup it cannot style.
+    ///
+    /// A right-click on a cell whose own contents handle the event (a button,
+    /// a text input) never reaches here, the same rule left-clicks follow.
+    pub fn on_right_click(mut self, on_right_click: impl Fn(Click) -> Message + 'a) -> Self {
+        self.on_right_click = Some(Box::new(on_right_click));
+        self
+    }
+
     /// Blank strip at each side of the table, inside the widget but belonging
     /// to no column.
     ///
@@ -460,6 +553,27 @@ where
         }
     }
 
+    /// Which leaf column contains this *screen* point.
+    ///
+    /// `None` in the gutters and in the inter-column spacing, which is the
+    /// answer callers want: those pixels deliberately belong to no column.
+    fn column_at(&self, point: Point, bounds: Rectangle, state: &State) -> Option<usize> {
+        let x = content_x(point.x, bounds, state);
+        let last = state.widths.len().checked_sub(1)?;
+
+        if x < state.offsets[0] || x >= state.offsets[last] + state.widths[last] {
+            return None;
+        }
+
+        // Inside the columns, the spacing between two of them belongs to the
+        // one on its left. Testing each column's own width instead leaves a
+        // `spacing`-wide dead strip between every pair that reports "gutter",
+        // which would silently fall through to row selection.
+        (0..state.widths.len())
+            .rev()
+            .find(|&i| x >= state.offsets[i])
+    }
+
     /// Which sortable column's control is under this *screen* point.
     fn sort_zone_at(&self, point: Point, bounds: Rectangle, state: &State) -> Option<usize> {
         if state.widths.len() != self.columns.len() {
@@ -473,7 +587,7 @@ where
                 let zone = self.sort_zone(cell, state, bounds);
 
                 Rectangle {
-                    x: zone.x - state.offset.x,
+                    x: screen_x(zone.x - bounds.x, bounds, state),
                     ..zone
                 }
                 .contains(point)
@@ -526,6 +640,35 @@ fn body_region(bounds: Rectangle, header_height: f32) -> Rectangle {
         y: bounds.y + header_height,
         width: bounds.width,
         height: (bounds.height - header_height).max(0.0),
+    }
+}
+
+/// Screen x for a point in content space.
+///
+/// The frozen strip does not move, so anything inside it maps straight through
+/// while everything else is shifted by the scroll offset. Every hit test goes
+/// through here rather than subtracting `offset.x` directly -- doing it by hand
+/// puts the resize handles and sort controls of the frozen columns wherever the
+/// scrolling ones happen to be.
+fn screen_x(content: f32, bounds: Rectangle, state: &State) -> f32 {
+    if content <= state.frozen_width {
+        bounds.x + content
+    } else {
+        bounds.x + content - state.offset.x
+    }
+}
+
+/// Content-space x for a point on screen. Inverse of [`screen_x`].
+///
+/// Cannot land on a frozen column by accident: a point outside the strip is
+/// shifted by a non-negative offset, so it always resolves past the strip.
+fn content_x(x: f32, bounds: Rectangle, state: &State) -> f32 {
+    let local = x - bounds.x;
+
+    if local < state.frozen_width {
+        local
+    } else {
+        local + state.offset.x
     }
 }
 
@@ -584,7 +727,11 @@ fn resize_edge_at(
     let last = state.widths.len().saturating_sub(1);
 
     (0..state.widths.len()).rev().find(|&i| {
-        let edge = bounds.x + state.offsets[i] + state.widths[i] + spacing / 2.0 - state.offset.x;
+        let edge = screen_x(
+            state.offsets[i] + state.widths[i] + spacing / 2.0,
+            bounds,
+            state,
+        );
 
         (point.x - edge).abs() <= tolerance
             && over_leaf(i)
@@ -613,9 +760,12 @@ fn header_cell_at(
     let mut best: Option<(usize, usize)> = None;
 
     for (i, cell) in cells.iter().enumerate() {
-        let left = bounds.x + state.offsets[cell.start] - state.offset.x;
-        let right =
-            bounds.x + state.offsets[cell.end] + state.widths[cell.end] - state.offset.x + spacing;
+        let left = screen_x(state.offsets[cell.start], bounds, state);
+        let right = screen_x(
+            state.offsets[cell.end] + state.widths[cell.end] + spacing,
+            bounds,
+            state,
+        );
         // `top`, not `row`: the blank band above a group that was pushed down
         // to meet its children is part of that group's hit box, so there is no
         // dead strip in the header that swallows clicks.
@@ -702,7 +852,7 @@ where
             let size = node.size();
             // A sortable column has to be wide enough for its label *and* its
             // arrow, or the two overlap the moment the label fills the cell.
-            let width = size.width + h_pad + if self.is_sortable(&cell) { SORT_ZONE } else { 0.0 };
+            let width = size.width + h_pad + if self.is_sortable(&cell) { SORT_ZONE + SORT_GAP } else { 0.0 };
 
             if cell.is_leaf() {
                 intrinsic[cell.start] = intrinsic[cell.start].max(width);
@@ -719,13 +869,27 @@ where
                 header_row_height.max((size.height + v_pad) / cell.row_span.max(1) as f32);
         }
 
+        // Spread the sample across the whole table rather than taking the first
+        // N rows.
+        //
+        // Sampling the head makes every column's width a function of **row
+        // order**. Re-sorting moves different values into the sampled window,
+        // the measured intrinsic changes, and the columns visibly resize even
+        // though not one cell's content changed -- which is exactly why sorting
+        // by First or Last used to shuffle the Contact columns around. A
+        // constant stride sees every part of the data whatever order it is in.
         let sample = self
             .measure_sample
             .unwrap_or(self.row_count)
             .min(self.row_count);
         let mut row_height = self.min_row_height;
 
-        for row in 0..sample {
+        for step in 0..sample {
+            // `step * row_count / sample` rather than `step * stride`: it
+            // reaches the last row instead of stopping a whole stride short of
+            // it, so the tail of the table is sampled like everywhere else.
+            let row = step * self.row_count / sample;
+
             for column in 0..columns {
                 let index = self.cell_index(row, column);
                 let node = self.elements[index].as_widget_mut().layout(
@@ -737,6 +901,32 @@ where
 
                 intrinsic[column] = intrinsic[column].max(size.width + h_pad);
                 row_height = row_height.max(size.height + v_pad);
+            }
+        }
+
+        // Latch the measurement so a column can never *shrink* while it holds
+        // the same rows.
+        //
+        // A stride still only looks at a subset, so a re-sort can still move a
+        // long value out of the sampled set. Remembering the widest we have
+        // ever seen turns any residual jitter into one-way growth that settles,
+        // instead of columns twitching back and forth on every sort.
+        //
+        // Keyed on the row count so it does not become a permanent floor: a
+        // sort reorders rows without changing how many there are, so the latch
+        // holds across it, while loading or filtering the data re-measures from
+        // scratch.
+        {
+            let state = tree.state.downcast_mut::<State>();
+
+            if state.measured.len() != columns || state.measured_rows != self.row_count {
+                state.measured = intrinsic.clone();
+                state.measured_rows = self.row_count;
+            } else {
+                for (column, width) in intrinsic.iter_mut().enumerate() {
+                    state.measured[column] = state.measured[column].max(*width);
+                    *width = state.measured[column];
+                }
             }
         }
 
@@ -798,7 +988,7 @@ where
             let cell = self.header_cells[i];
             let width = sizing::span_width(&widths, cell.start, cell.end, self.spacing);
             let height = header_row_height * cell.row_span as f32;
-            let reserve = if self.is_sortable(&cell) { SORT_ZONE } else { 0.0 };
+            let reserve = if self.is_sortable(&cell) { SORT_ZONE + SORT_GAP } else { 0.0 };
             let inner = Size::new(
                 (width - h_pad - reserve).max(0.0),
                 (height - v_pad).max(0.0),
@@ -879,7 +1069,17 @@ where
             Size::new(content_width, header_height + body_height),
         );
 
+        // Where the frozen strip ends, in content space. Includes the leading
+        // gutter, since that scrolls with the first column and would otherwise
+        // slide out from under it.
+        let frozen_width = self
+            .sticky_columns
+            .checked_sub(1)
+            .map(|last| offsets[last] + widths[last])
+            .unwrap_or(0.0);
+
         let state = tree.state.downcast_mut::<State>();
+        state.frozen_width = frozen_width;
         state.widths = widths;
         state.offsets = offsets;
         state.header_row_height = header_row_height;
@@ -955,16 +1155,60 @@ where
         // Body layer -- clipped to the region below the header, translated on
         // both axes.
         // ------------------------------------------------------------------
-        let body_cursor = local_cursor(cursor, body, offset);
+        // Split into horizontal bands: the scrolling columns, then the frozen
+        // ones painted over them in their own clip with **no X translation**.
+        // That single difference is what makes a column stick, exactly as the
+        // header's missing Y translation is what makes it stick -- which is why
+        // this was worth structuring in layers before the feature existed.
+        //
+        // Each band redraws the full-width furniture (stripes, row highlights,
+        // dividers) and lets its own clip cut it down. Trying to restrict each
+        // piece to its band by arithmetic instead means every one of them has
+        // to learn about freezing.
+        let frozen = state.frozen_width.min(body.width);
+        let bands: [(Rectangle, f32, std::ops::Range<usize>); 2] = [
+            (
+                Rectangle {
+                    x: body.x + frozen,
+                    width: (body.width - frozen).max(0.0),
+                    ..body
+                },
+                -offset.x,
+                self.sticky_columns..columns,
+            ),
+            (
+                Rectangle {
+                    width: frozen,
+                    ..body
+                },
+                0.0,
+                0..self.sticky_columns,
+            ),
+        ];
+
+        let mut paint_body = |renderer: &mut Renderer,
+                              region: Rectangle,
+                              shift_x: f32,
+                              range: std::ops::Range<usize>| {
+        // Per band, never shared. Children are laid out in content space, so
+        // the viewport they are culled and clipped against has to be *this
+        // band's* slice of content space -- and the frozen band's slice is not
+        // shifted by the scroll offset.
+        //
+        // Handing both bands the scrolling viewport clips the frozen columns'
+        // contents against a rectangle they are not inside, so their text
+        // vanishes a character at a time as you scroll sideways while their
+        // backgrounds, rules and hit boxes all stay put and keep working.
+        let body_cursor = local_cursor(cursor, region, Vector::new(-shift_x, offset.y));
         let body_viewport = Rectangle {
-            x: body.x + offset.x,
-            y: body.y + offset.y,
-            width: body.width,
-            height: body.height,
+            x: region.x - shift_x,
+            y: region.y + offset.y,
+            width: region.width,
+            height: region.height,
         };
 
-        renderer.with_layer(body, |renderer| {
-            renderer.with_translation(Vector::new(-offset.x, -offset.y), |renderer| {
+        renderer.with_layer(region, |renderer| {
+            renderer.with_translation(Vector::new(shift_x, -offset.y), |renderer| {
                 let (first, last) = scroll::visible_rows(
                     offset.y,
                     body.height,
@@ -1059,7 +1303,7 @@ where
                 // a coloured cell. A translucent colour shows through both.
                 if !cell_styles.is_empty() {
                     for row in first..last {
-                        for column in 0..columns {
+                        for column in range.clone() {
                             if let Some(background) = style_of(row, column).background {
                                 renderer.fill_quad(
                                     renderer::Quad {
@@ -1193,11 +1437,60 @@ where
                     }
                 }
 
+                // The selected cell, last of the highlights and above the
+                // dividers: it is the most specific thing the grid can point
+                // at, so nothing else should be able to obscure it.
+                if let Some(position) = self.selected_cell.filter(|c| {
+                    c.row >= first
+                        && c.row < last
+                        && c.column < state.widths.len()
+                        && range.contains(&c.column)
+                }) {
+                    let band = cell_rect(position.row, position.column);
+
+                    if let Some(background) = appearance.selected_cell_background {
+                        renderer.fill_quad(
+                            renderer::Quad {
+                                bounds: band,
+                                ..Default::default()
+                            },
+                            background,
+                        );
+                    }
+
+                    if let Some(color) = appearance.selected_cell_border {
+                        let edges = [
+                            Rectangle { height: rule, ..band },
+                            Rectangle {
+                                y: band.y + band.height - rule,
+                                height: rule,
+                                ..band
+                            },
+                            Rectangle { width: rule, ..band },
+                            Rectangle {
+                                x: band.x + band.width - rule,
+                                width: rule,
+                                ..band
+                            },
+                        ];
+
+                        for edge in edges {
+                            renderer.fill_quad(
+                                renderer::Quad {
+                                    bounds: edge,
+                                    ..Default::default()
+                                },
+                                color,
+                            );
+                        }
+                    }
+                }
+
                 // Only visible rows are drawn. This is arithmetic on the row
                 // range rather than a rectangle test per child, which is what
                 // makes large tables cheap to redraw.
                 for row in first..last {
-                    for column in 0..columns {
+                    for column in range.clone() {
                         let index = self.cell_index(row, column);
 
                         // A cell colour is *inherited*, not imposed: a `text`
@@ -1221,6 +1514,13 @@ where
                 }
             });
         });
+        };
+
+        for (region, shift_x, range) in bands {
+            if !range.is_empty() && region.width > 0.0 {
+                paint_body(renderer, region, shift_x, range);
+            }
+        }
 
         // ------------------------------------------------------------------
         // Header layer -- same clip discipline, but translated only on X.
@@ -1232,15 +1532,6 @@ where
             width: bounds.width,
             height: state.header_height,
         };
-        let header_cursor = local_cursor(cursor, header_region, Vector::new(offset.x, 0.0));
-        // Children sit in content space, so their viewport has to be pushed by
-        // the same offset the body's is -- otherwise a header element scrolled
-        // sideways is clipped against a rectangle it is no longer in.
-        let header_viewport = Rectangle {
-            x: header_region.x + offset.x,
-            ..header_region
-        };
-
         let header_style = renderer::Style {
             text_color: appearance.header_text.unwrap_or(style.text_color),
         };
@@ -1251,7 +1542,41 @@ where
                 .unwrap_or(style.text_color),
         };
 
-        renderer.with_layer(header_region, |renderer| {
+        // Same two bands as the body, and for the same reason. A header cell is
+        // wholly inside the frozen run or wholly outside it -- never split --
+        // because the run is a whole number of top-level nodes.
+        let header_bands: [(Rectangle, f32, std::ops::Range<usize>); 2] = [
+            (
+                Rectangle {
+                    x: header_region.x + frozen,
+                    width: (header_region.width - frozen).max(0.0),
+                    ..header_region
+                },
+                -offset.x,
+                self.sticky_columns..columns,
+            ),
+            (
+                Rectangle {
+                    width: frozen,
+                    ..header_region
+                },
+                0.0,
+                0..self.sticky_columns,
+            ),
+        ];
+
+        let mut paint_header = |renderer: &mut Renderer,
+                                region: Rectangle,
+                                shift_x: f32,
+                                range: std::ops::Range<usize>| {
+        // Per band, for the same reason the body's are.
+        let header_cursor = local_cursor(cursor, region, Vector::new(-shift_x, 0.0));
+        let header_viewport = Rectangle {
+            x: region.x - shift_x,
+            ..region
+        };
+
+        renderer.with_layer(region, |renderer| {
             // One band behind the whole header, outside the translation so it
             // covers the viewport regardless of horizontal scroll. Group levels
             // are then painted per span on top, rather than as a full-width
@@ -1260,14 +1585,14 @@ where
             if let Some(background) = appearance.header_background {
                 renderer.fill_quad(
                     renderer::Quad {
-                        bounds: header_region,
+                        bounds: region,
                         ..Default::default()
                     },
                     background,
                 );
             }
 
-            renderer.with_translation(Vector::new(-offset.x, 0.0), |renderer| {
+            renderer.with_translation(Vector::new(shift_x, 0.0), |renderer| {
                 let rule = appearance.divider_width();
                 let band = state.header_row_height;
                 let foot = bounds.y + state.header_height;
@@ -1450,7 +1775,15 @@ where
                     }
                 }
 
-                for cell in &self.header_cells {
+                // The furniture above is left to the clip, the same as in the
+                // body. The *labels* are filtered instead: they are real
+                // widgets, and drawing each one twice only to throw one copy
+                // away is work, not just overdraw.
+                for cell in self
+                    .header_cells
+                    .iter()
+                    .filter(|cell| cell.start >= range.start && cell.end < range.end)
+                {
                     self.elements[cell.element].as_widget().draw(
                         &tree.children[cell.element],
                         renderer,
@@ -1473,7 +1806,7 @@ where
                         bounds: Rectangle {
                             y: bounds.y + state.header_height - appearance.divider_width(),
                             height: appearance.divider_width(),
-                            ..header_region
+                            ..region
                         },
                         ..Default::default()
                     },
@@ -1481,6 +1814,44 @@ where
                 );
             }
         });
+        };
+
+        for (region, shift_x, range) in header_bands {
+            if !range.is_empty() && region.width > 0.0 {
+                paint_header(renderer, region, shift_x, range);
+            }
+        }
+
+        // The seam between frozen and scrolling columns, running the full
+        // height over both. Without it the frozen columns look like they are
+        // simply refusing to scroll rather than like a pinned region.
+        //
+        // In a layer of its own, and this is not optional. Layers render in
+        // creation order, and drawing into the *base* layer after a sub-layer
+        // has closed still files the primitive in the base layer -- which
+        // renders underneath. Filled directly here, the seam was painted over
+        // by every band that came before it and survived only on the rows the
+        // stripes happened to leave alone.
+        if self.sticky_columns > 0 && frozen > 0.0 {
+            if let Some(color) = appearance.frozen_divider {
+                let rule = appearance.divider_width();
+
+                renderer.with_layer(bounds, |renderer| {
+                    renderer.fill_quad(
+                        renderer::Quad {
+                            bounds: Rectangle {
+                                x: bounds.x + frozen - rule,
+                                y: bounds.y,
+                                width: rule,
+                                height: bounds.height,
+                            },
+                            ..Default::default()
+                        },
+                        color,
+                    );
+                });
+            }
+        }
 
         // ------------------------------------------------------------------
         // Scrollbars -- untranslated, and in a layer of their own.
@@ -1833,6 +2204,141 @@ where
             return;
         }
 
+        // Ahead of row selection: a right-click opens a menu, it does not move
+        // the selection out from under the menu that is about to appear.
+        if let (Some(on_right_click), Event::Mouse(mouse::Event::ButtonPressed(
+            mouse::Button::Right,
+        ))) = (&self.on_right_click, event)
+        {
+            if let Some(point) = cursor.position_over(bounds) {
+                let state = tree.state.downcast_ref::<State>();
+                let row = scroll::row_at(point, body, offset.y, row_height, self.row_count);
+                let column = self.column_at(point, bounds, state);
+
+                // Move the selection under the pointer first, so a menu acts on
+                // what was actually right-clicked.
+                //
+                // A cell wins wherever cell selection is on and the pointer is
+                // inside a column; a gutter click has no column and falls
+                // through to the row; a header click has no row and resolves to
+                // the column. Exactly the precedence a left-click follows.
+                let target = match (row, column) {
+                    (Some(row), Some(column)) if self.on_select_cell.is_some() => {
+                        Some(Target::Cell(CellPosition::new(row, column)))
+                    }
+                    (Some(row), _) if self.mode != Mode::None => Some(Target::Row(row)),
+                    (None, Some(column)) if self.column_mode != Mode::None => {
+                        Some(Target::Column(column))
+                    }
+                    _ => None,
+                };
+
+                if let Some(target) = target {
+                    // Re-point the selection, but only when the target is
+                    // *outside* the current one: right-clicking one of several
+                    // selected rows has to keep all of them, or "delete
+                    // selected" silently narrows to one the moment the menu
+                    // opens on it.
+                    match target {
+                        Target::Cell(position) if self.selected_cell != Some(position) => {
+                            if let Some(on_cell) = &self.on_select_cell {
+                                shell.publish(on_cell(Some(position)));
+                            }
+                        }
+                        Target::Row(row) if !self.selected.contains(&row) => {
+                            if let Some(on_rows) = &self.on_select {
+                                shell.publish(on_rows(BTreeSet::from([row])));
+                            }
+                        }
+                        Target::Column(column) if !self.selected_columns.contains(&column) => {
+                            if let Some(on_columns) = &self.on_select_column {
+                                shell.publish(on_columns(BTreeSet::from([column])));
+                            }
+                        }
+                        _ => {}
+                    }
+
+                    // And clear the other two readings. A left-click already
+                    // does this; without it here, a menu can open on a cell
+                    // while a row is still lit, and nothing on screen says
+                    // which of them an action would apply to.
+                    if !matches!(target, Target::Cell(_)) && self.selected_cell.is_some() {
+                        if let Some(on_cell) = &self.on_select_cell {
+                            shell.publish(on_cell(None));
+                        }
+                    }
+
+                    if !matches!(target, Target::Row(_)) && !self.selected.is_empty() {
+                        if let Some(on_rows) = &self.on_select {
+                            shell.publish(on_rows(BTreeSet::new()));
+                        }
+                    }
+
+                    if !matches!(target, Target::Column(_)) && !self.selected_columns.is_empty() {
+                        if let Some(on_columns) = &self.on_select_column {
+                            shell.publish(on_columns(BTreeSet::new()));
+                        }
+                    }
+                }
+
+                shell.publish(on_right_click(Click {
+                    row,
+                    column,
+                    position: point,
+                }));
+                shell.capture_event();
+                return;
+            }
+        }
+
+        // --- 4a. cell selection ---
+        //
+        // Ahead of row selection, and it only claims clicks that land *inside*
+        // a column. A click in a gutter finds no column and falls through --
+        // which is the whole point of the gutter, and the only reason row
+        // selection still has somewhere to live once every cell is
+        // individually selectable.
+        if let (
+            Some(on_select_cell),
+            Event::Mouse(mouse::Event::ButtonPressed(mouse::Button::Left)),
+        ) = (&self.on_select_cell, event)
+        {
+            if let Some(point) = cursor.position_over(body) {
+                let state = tree.state.downcast_ref::<State>();
+
+                let hit = scroll::row_at(point, body, offset.y, row_height, self.row_count)
+                    .zip(self.column_at(point, bounds, state));
+
+                if let Some((row, column)) = hit {
+                    let position = CellPosition::new(row, column);
+
+                    // Guarded so re-clicking the same cell is not an endless
+                    // stream of identical messages.
+                    if self.selected_cell != Some(position) {
+                        shell.publish(on_select_cell(Some(position)));
+                    }
+
+                    for message in [
+                        (!self.selected.is_empty())
+                            .then(|| self.on_select.as_ref().map(|f| f(BTreeSet::new())))
+                            .flatten(),
+                        (!self.selected_columns.is_empty())
+                            .then(|| self.on_select_column.as_ref().map(|f| f(BTreeSet::new())))
+                            .flatten(),
+                    ]
+                    .into_iter()
+                    .flatten()
+                    {
+                        shell.publish(message);
+                    }
+
+                    shell.capture_event();
+                    shell.request_redraw();
+                    return;
+                }
+            }
+        }
+
         if self.mode != Mode::None {
             match event {
                 Event::Mouse(mouse::Event::CursorMoved { .. }) => {
@@ -1878,6 +2384,12 @@ where
                             if !self.selected_columns.is_empty() {
                                 if let Some(on_columns) = &self.on_select_column {
                                     shell.publish(on_columns(BTreeSet::new()));
+                                }
+                            }
+
+                            if self.selected_cell.is_some() {
+                                if let Some(on_cell) = &self.on_select_cell {
+                                    shell.publish(on_cell(None));
                                 }
                             }
 
@@ -1994,6 +2506,12 @@ where
                         if !self.selected.is_empty() {
                             if let Some(on_rows) = &self.on_select {
                                 shell.publish(on_rows(BTreeSet::new()));
+                            }
+                        }
+
+                        if self.selected_cell.is_some() {
+                            if let Some(on_cell) = &self.on_select_cell {
+                                shell.publish(on_cell(None));
                             }
                         }
 

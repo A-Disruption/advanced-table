@@ -50,6 +50,7 @@ impl ColumnSpec {
 pub struct HeaderNode<'a, Message, Theme, Renderer> {
     pub(crate) content: Element<'a, Message, Theme, Renderer>,
     pub(crate) kind: NodeKind<'a, Message, Theme, Renderer>,
+    pub(crate) sticky: bool,
 }
 
 pub(crate) enum NodeKind<'a, Message, Theme, Renderer> {
@@ -64,6 +65,7 @@ pub fn leaf<'a, Message, Theme, Renderer>(
     HeaderNode {
         content: content.into(),
         kind: NodeKind::Leaf(ColumnSpec::default()),
+        sticky: false,
     }
 }
 
@@ -75,6 +77,7 @@ pub fn group<'a, Message, Theme, Renderer>(
     HeaderNode {
         content: content.into(),
         kind: NodeKind::Group(children.into_iter().collect()),
+        sticky: false,
     }
 }
 
@@ -101,6 +104,23 @@ impl<'a, Message, Theme, Renderer> HeaderNode<'a, Message, Theme, Renderer> {
         if let NodeKind::Leaf(spec) = &mut self.kind {
             spec.sortable = true;
         }
+        self
+    }
+
+    /// Pin this node against the leading edge so it stays put while the rest of
+    /// the table scrolls sideways.
+    ///
+    /// Freezing is **positional**: a frozen region has to be attached to an
+    /// edge, or there is no coherent place to draw it. So only an unbroken run
+    /// of top-level nodes starting at the very first one is honoured -- see
+    /// [`flatten`]. Marking a nested node, or one that comes after a
+    /// non-sticky sibling, is ignored rather than producing a frozen island
+    /// with scrolling columns on both sides of it.
+    ///
+    /// A sticky group takes every column beneath it, which is what keeps a
+    /// group from being split down the middle by the frozen boundary.
+    pub fn sticky(mut self) -> Self {
+        self.sticky = true;
         self
     }
 
@@ -163,6 +183,16 @@ pub struct Flattened<'a, Message, Theme, Renderer> {
     pub cells: Vec<HeaderCell>,
     pub columns: Vec<ColumnSpec>,
     pub rows: usize,
+    /// How many leading leaf columns are frozen. Always a prefix, so every
+    /// header cell is either wholly inside it or wholly outside.
+    pub sticky_columns: usize,
+}
+
+fn leaf_count<Message, Theme, Renderer>(node: &HeaderNode<'_, Message, Theme, Renderer>) -> usize {
+    match &node.kind {
+        NodeKind::Leaf(_) => 1,
+        NodeKind::Group(children) => children.iter().map(leaf_count).sum(),
+    }
 }
 
 /// Depth-first flatten. Leaf order becomes column order, which is what makes
@@ -187,11 +217,23 @@ pub fn flatten<'a, Message, Theme, Renderer>(
 ) -> Flattened<'a, Message, Theme, Renderer> {
     let depth = nodes.iter().map(max_depth).max().unwrap_or(1);
 
+    // The frozen region is the leading *run* of sticky top-level nodes, counted
+    // before the walk consumes them. Taking only the run -- rather than every
+    // node that happens to be marked -- is what guarantees the result is a
+    // prefix of the columns, and therefore that it has a leading edge to be
+    // pinned against and never splits a group in half.
+    let sticky_columns = nodes
+        .iter()
+        .take_while(|node| node.sticky)
+        .map(leaf_count)
+        .sum();
+
     let mut out = Flattened {
         elements: Vec::new(),
         cells: Vec::new(),
         columns: Vec::new(),
         rows: depth,
+        sticky_columns,
     };
 
     for node in nodes {
@@ -332,6 +374,42 @@ mod tests {
         let name = f.cells.iter().find(|c| c.start == 0 && c.is_leaf()).unwrap();
         assert_eq!(name.row, 0);
         assert_eq!(name.row_span, 2);
+    }
+
+    #[test]
+    fn sticky_is_the_leading_run_and_takes_whole_groups() {
+        let f = flatten(vec![
+            text_leaf("ID").sticky(),
+            group(
+                iced::widget::text("Contact"),
+                vec![text_leaf("First"), text_leaf("Last")],
+            )
+            .sticky(),
+            text_leaf("Revenue"),
+            // Marked, but the run is already broken. Honouring this would
+            // freeze a column with a scrolling one to its left, which has
+            // nowhere coherent to be drawn.
+            text_leaf("Actions").sticky(),
+        ]);
+
+        assert_eq!(f.sticky_columns, 3, "ID plus both of Contact's leaves");
+    }
+
+    #[test]
+    fn sticky_is_ignored_below_the_top_level() {
+        // Freezing an inner leaf would split its group across the boundary.
+        let f = flatten(vec![group(
+            iced::widget::text("Contact"),
+            vec![text_leaf("First").sticky(), text_leaf("Last")],
+        )]);
+
+        assert_eq!(f.sticky_columns, 0);
+    }
+
+    #[test]
+    fn nothing_is_sticky_by_default() {
+        let f = flatten(vec![text_leaf("A"), text_leaf("B")]);
+        assert_eq!(f.sticky_columns, 0);
     }
 
     #[test]

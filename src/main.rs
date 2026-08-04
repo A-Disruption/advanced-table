@@ -4,7 +4,8 @@
 //! code. Notes on what to actually look for are in `CHECKS` below.
 
 use advanced_table::{
-    group, leaf, CellStyle, DataTable, Direction, Overflow, Policy, SelectionMode, Sizing, Sort,
+    group, leaf, CellPosition, CellStyle, Click, DataTable, Direction, Overflow, Policy,
+    SelectionMode, Sizing, Sort,
 };
 
 use std::collections::BTreeSet;
@@ -50,6 +51,11 @@ use iced::{alignment, Color, Element, Fill, Length, Task};
 ///     header anywhere *other* than the arrow must still select the column.
 /// 14. Shift-select a block of rows. The outline must box the whole block once,
 ///     not each row separately.
+/// 15. Sort by First, then by Last, then back. No column may change width --
+///     the same rows are present either way, only in a different order.
+/// 16. Turn on "Cell selection". Clicking any cell must select just that cell,
+///     and the only place left that still selects a row is the gutter at either
+///     edge. Right-click anywhere and the status line names what was under it.
 const CHECKS: () = ();
 
 fn main() -> iced::Result {
@@ -122,6 +128,10 @@ enum Message {
     ToggleStripes(bool),
     ToggleConditional(bool),
     SortChanged(Option<Sort>),
+    RightClicked(Click),
+    ToggleCells(bool),
+    ToggleSticky(bool),
+    CellChanged(Option<CellPosition>),
 }
 
 struct Demo {
@@ -131,7 +141,10 @@ struct Demo {
     groups: bool,
     stripes: bool,
     conditional: bool,
+    cells: bool,
+    sticky: bool,
     sort: Option<Sort>,
+    selected_cell: Option<CellPosition>,
     selected: BTreeSet<usize>,
     selected_columns: BTreeSet<usize>,
     status: String,
@@ -146,7 +159,10 @@ impl Default for Demo {
             groups: true,
             stripes: true,
             conditional: true,
+            cells: false,
+            sticky: true,
             sort: None,
+            selected_cell: None,
             selected: BTreeSet::new(),
             selected_columns: BTreeSet::new(),
             status: String::from("no row clicked yet"),
@@ -261,6 +277,28 @@ impl Demo {
                 self.selected.clear();
                 self.resort();
             }
+            // A real app would open a context menu here, positioned at
+            // `click.position`. The status line stands in for it.
+            Message::ToggleSticky(sticky) => self.sticky = sticky,
+            Message::ToggleCells(cells) => {
+                self.cells = cells;
+                self.selected_cell = None;
+            }
+            Message::CellChanged(cell) => {
+                self.status = match cell {
+                    Some(cell) => format!("selected cell ({}, {})", cell.row, cell.column),
+                    None => "no cell selected".to_string(),
+                };
+                self.selected_cell = cell;
+            }
+            Message::RightClicked(click) => {
+                self.status = match (click.row, click.column) {
+                    (Some(row), Some(column)) => format!("right-click on cell ({row}, {column})"),
+                    (Some(row), None) => format!("right-click on row {row}'s gutter"),
+                    (None, Some(column)) => format!("right-click on column {column}'s header"),
+                    (None, None) => "right-click outside every cell".to_string(),
+                };
+            }
         }
 
         Task::none()
@@ -289,6 +327,12 @@ impl Demo {
             checkbox(self.conditional)
                 .label("Conditional")
                 .on_toggle(Message::ToggleConditional),
+            checkbox(self.cells)
+                .label("Cell selection")
+                .on_toggle(Message::ToggleCells),
+            checkbox(self.sticky)
+                .label("Sticky ID + Contact")
+                .on_toggle(Message::ToggleSticky),
         ]
         .spacing(12)
         .align_y(alignment::Vertical::Center);
@@ -297,16 +341,22 @@ impl Demo {
         // three-level path can be compared without changing anything else.
         let headers = if self.groups {
             vec![
-                leaf(text("ID"))
-                    .fixed(70.0)
-                    .align(alignment::Horizontal::Right)
-                    .sortable(),
-                group(
-                    text("Contact"),
-                    vec![
-                        leaf(text("First")).fill(1).sortable(),
-                        leaf(text("Last")).fill(2).sortable(),
-                    ],
+                pin(
+                    leaf(text("ID"))
+                        .fixed(70.0)
+                        .align(alignment::Horizontal::Right)
+                        .sortable(),
+                    self.sticky,
+                ),
+                pin(
+                    group(
+                        text("Contact"),
+                        vec![
+                            leaf(text("First")).fill(1).sortable(),
+                            leaf(text("Last")).fill(2).sortable(),
+                        ],
+                    ),
+                    self.sticky,
                 ),
                 // This label is wider than the four numeric columns beneath it,
                 // which is what exercises apply_span_constraints.
@@ -341,11 +391,14 @@ impl Demo {
             ]
         } else {
             vec![
-                leaf(text("ID"))
-                    .fixed(70.0)
-                    .align(alignment::Horizontal::Right)
-                    .sortable(),
-                leaf(text("First")).fill(1).sortable(),
+                pin(
+                    leaf(text("ID"))
+                        .fixed(70.0)
+                        .align(alignment::Horizontal::Right)
+                        .sortable(),
+                    self.sticky,
+                ),
+                pin(leaf(text("First")).fill(1).sortable(), self.sticky),
                 leaf(text("Last")).fill(2).sortable(),
                 leaf(text("Q3 Revenue"))
                     .align(alignment::Horizontal::Right)
@@ -367,7 +420,7 @@ impl Demo {
         let conditional = self.conditional;
         let records = &self.records;
 
-        let table = DataTable::new(headers)
+        let mut table = DataTable::new(headers)
             .rows(&self.records, |record, column| match column {
                 0 => text(record.id).into(),
                 1 => text(record.first).into(),
@@ -394,6 +447,7 @@ impl Demo {
                 Message::ColumnsChanged,
             )
             .sorting(self.sort, Message::SortChanged)
+            .on_right_click(Message::RightClicked)
             .overflow(match self.overflow {
                 OverflowChoice::Scroll => Overflow::Scroll,
                 OverflowChoice::Shrink => Overflow::Shrink,
@@ -452,6 +506,13 @@ impl Demo {
                 }
             });
 
+        // Left off entirely when the toggle is down, so the "does enabling
+        // this take row selection away?" question can be answered by flipping
+        // one checkbox: with it on, only the gutters still select a row.
+        if self.cells {
+            table = table.cell_selection(self.selected_cell, Message::CellChanged);
+        }
+
         column![
             controls,
             container(table).height(Fill).width(Fill),
@@ -461,6 +522,21 @@ impl Demo {
         .padding(16)
         .height(Fill)
         .into()
+    }
+}
+
+/// `.sticky()` is a builder, so toggling it needs a conditional rather than a
+/// chained call. A free function rather than a closure: closure lifetime
+/// inference ties the argument and the return value to different regions and
+/// then refuses to unify them.
+fn pin<'a, Message, Theme, Renderer>(
+    node: advanced_table::HeaderNode<'a, Message, Theme, Renderer>,
+    sticky: bool,
+) -> advanced_table::HeaderNode<'a, Message, Theme, Renderer> {
+    if sticky {
+        node.sticky()
+    } else {
+        node
     }
 }
 
