@@ -109,9 +109,11 @@ where
     on_sort: Option<Box<dyn Fn(Option<Sort>) -> Message + 'a>>,
 
     on_right_click: Option<Box<dyn Fn(Click) -> Message + 'a>>,
+    on_copy: Option<Box<dyn Fn() -> Message + 'a>>,
 
-    selected_cell: Option<CellPosition>,
-    on_select_cell: Option<Box<dyn Fn(Option<CellPosition>) -> Message + 'a>>,
+    cell_mode: Mode,
+    selected_cells: BTreeSet<CellPosition>,
+    on_select_cell: Option<Box<dyn Fn(BTreeSet<CellPosition>) -> Message + 'a>>,
 
     /// Blank strip at the left and right edges, inside the widget but outside
     /// every column.
@@ -175,9 +177,59 @@ struct State {
     /// why it lives here while the selection set itself does not.
     anchor: Option<usize>,
     column_anchor: Option<usize>,
+    cell_anchor: Option<CellPosition>,
+
+    /// The moving end of the selection -- the "active" cell a spreadsheet draws
+    /// its heavy outline around.
+    ///
+    /// Distinct from the anchor, and it has to be. A Shift+arrow steps the
+    /// *focus* one place and re-spans from the anchor; stepping the anchor
+    /// instead makes every extend measure one step from the origin, so the
+    /// block never grows past two items however long you hold the key.
+    row_focus: Option<usize>,
+    column_focus: Option<usize>,
+    cell_focus: Option<CellPosition>,
     hovered: Option<usize>,
     /// Leaf column whose sort control the pointer is over.
     hovered_sort: Option<usize>,
+
+    /// A sweep in progress. Ephemeral, like the anchors.
+    drag: Option<Drag>,
+
+    /// Whether the last click landed inside the table.
+    ///
+    /// Arrow keys are global -- every widget sees them -- so without this the
+    /// table would fight every other focusable thing on the page for them.
+    /// Click-to-focus rather than a real focus operation: the widget has no
+    /// `Id`, and this is enough to make the keys behave.
+    focused: bool,
+}
+
+/// A drag-select in progress.
+#[derive(Debug, Clone)]
+struct Drag {
+    kind: DragKind,
+    /// The selection to union each sweep onto.
+    ///
+    /// Empty for a plain drag, which makes the sweep a straight replace. For a
+    /// Ctrl-drag it holds the selection as it stood just after the press, so
+    /// the second block accumulates onto the first. It has to be a *snapshot*:
+    /// unioning against the live selection can only ever grow, so dragging
+    /// back over your own path would never give anything up.
+    base: DragBase,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum DragKind {
+    Cell,
+    Row,
+    Column,
+}
+
+#[derive(Debug, Clone)]
+enum DragBase {
+    Cells(BTreeSet<CellPosition>),
+    Linear(BTreeSet<usize>),
 }
 
 /// Where a click landed, in table terms rather than pixels.
@@ -247,7 +299,9 @@ where
             sort: None,
             on_sort: None,
             on_right_click: None,
-            selected_cell: None,
+            on_copy: None,
+            cell_mode: Mode::None,
+            selected_cells: BTreeSet::new(),
             on_select_cell: None,
             gutter: 8.0,
             resizable: true,
@@ -421,13 +475,35 @@ where
     ///
     /// Same ownership rule as everything else here -- you hold the selection,
     /// the widget renders it and reports what it should become.
+    /// `Mode::Multiple` gives the standard spreadsheet gestures: Ctrl toggles
+    /// one cell, Shift extends a **rectangle** from the anchor, and dragging
+    /// sweeps a rectangle out live.
     pub fn cell_selection(
         mut self,
-        selected: Option<CellPosition>,
-        on_select: impl Fn(Option<CellPosition>) -> Message + 'a,
+        mode: Mode,
+        selected: &BTreeSet<CellPosition>,
+        on_select: impl Fn(BTreeSet<CellPosition>) -> Message + 'a,
     ) -> Self {
-        self.selected_cell = selected;
+        self.cell_mode = mode;
+        self.selected_cells = selected.clone();
         self.on_select_cell = Some(Box::new(on_select));
+        self
+    }
+
+    /// Fire on Ctrl+C (Cmd+C on macOS) while the table has focus and something
+    /// is selected.
+    ///
+    /// The table cannot do the copying, and it is worth being clear why: it
+    /// only ever sees the `Element` you built from a value, never the value
+    /// itself. There is no text for it to put on the clipboard.
+    ///
+    /// What it *can* contribute is the part that is easy to get wrong -- when
+    /// the shortcut belongs to this table rather than to some other focused
+    /// widget, and, via [`selection::grid`](crate::selection::grid), the
+    /// rectangle a spreadsheet expects. Build the text from your own data and
+    /// hand it to `iced::clipboard::write`.
+    pub fn on_copy(mut self, on_copy: impl Fn() -> Message + 'a) -> Self {
+        self.on_copy = Some(Box::new(on_copy));
         self
     }
 
@@ -522,6 +598,304 @@ where
 
     fn cell_index(&self, row: usize, column: usize) -> usize {
         self.header_len + row * self.columns.len() + column
+    }
+
+    /// Continue an in-progress drag-select. Returns whether the event was
+    /// consumed.
+    ///
+    /// Every kind re-resolves from the anchor fixed at the press rather than
+    /// accumulating per-move deltas, which is what lets a sweep give ground
+    /// back when you drag toward where you started.
+    #[allow(clippy::too_many_arguments)]
+    fn sweep(
+        &self,
+        tree: &mut Tree,
+        event: &Event,
+        bounds: Rectangle,
+        body: Rectangle,
+        cursor: mouse::Cursor,
+        row_height: f32,
+        offset: Vector,
+        shell: &mut Shell<'_, Message>,
+    ) -> bool {
+        match event {
+            Event::Mouse(mouse::Event::ButtonReleased(mouse::Button::Left))
+            | Event::Touch(touch::Event::FingerLifted { .. })
+            | Event::Touch(touch::Event::FingerLost { .. }) => {
+                // Cleared, but the release itself is left alone: other handlers
+                // still want it, and capturing here would swallow a child's
+                // button press completing.
+                tree.state.downcast_mut::<State>().drag = None;
+                false
+            }
+
+            Event::Mouse(mouse::Event::CursorMoved { .. })
+            | Event::Touch(touch::Event::FingerMoved { .. }) => {
+                let Some(point) = cursor.position() else {
+                    return false;
+                };
+
+                let (drag, cell_anchor, row_anchor, column_anchor, column) = {
+                    let state = tree.state.downcast_ref::<State>();
+
+                    (
+                        state.drag.clone(),
+                        state.cell_anchor,
+                        state.anchor,
+                        state.column_anchor,
+                        self.column_at(point, bounds, state),
+                    )
+                };
+
+                let Some(drag) = drag else {
+                    return false;
+                };
+
+                let row = scroll::row_at(point, body, offset.y, row_height, self.row_count);
+
+                // A sweep also moves the focus, so releasing the button and
+                // pressing Shift+arrow continues from where the drag stopped.
+                match (drag.kind, &drag.base) {
+                    (DragKind::Cell, DragBase::Cells(base)) => {
+                        let (Some(anchor), Some(row), Some(column)) = (cell_anchor, row, column)
+                        else {
+                            return false;
+                        };
+
+                        tree.state.downcast_mut::<State>().cell_focus =
+                            Some(CellPosition::new(row, column));
+
+                        let mut selection =
+                            selection::rectangle(anchor, CellPosition::new(row, column));
+                        selection.extend(base.iter().copied());
+
+                        if selection != self.selected_cells {
+                            if let Some(on_cell) = &self.on_select_cell {
+                                shell.publish(on_cell(selection));
+                            }
+                            shell.request_redraw();
+                        }
+                    }
+
+                    (DragKind::Row, DragBase::Linear(base)) => {
+                        let (Some(anchor), Some(row)) = (row_anchor, row) else {
+                            return false;
+                        };
+
+                        tree.state.downcast_mut::<State>().row_focus = Some(row);
+
+                        let mut selection = selection::span(anchor, row);
+                        selection.extend(base.iter().copied());
+
+                        if selection != self.selected {
+                            if let Some(on_rows) = &self.on_select {
+                                shell.publish(on_rows(selection));
+                            }
+                            shell.request_redraw();
+                        }
+                    }
+
+                    (DragKind::Column, DragBase::Linear(base)) => {
+                        let (Some(anchor), Some(column)) = (column_anchor, column) else {
+                            return false;
+                        };
+
+                        tree.state.downcast_mut::<State>().column_focus = Some(column);
+
+                        let mut selection = selection::span(anchor, column);
+                        selection.extend(base.iter().copied());
+
+                        if selection != self.selected_columns {
+                            if let Some(on_columns) = &self.on_select_column {
+                                shell.publish(on_columns(selection));
+                            }
+                            shell.request_redraw();
+                        }
+                    }
+
+                    _ => return false,
+                }
+
+                shell.capture_event();
+                true
+            }
+
+            _ => false,
+        }
+    }
+
+    /// Move the keyboard focus by one step and re-select. Returns whether
+    /// anything was moved.
+    fn move_focus(
+        &self,
+        tree: &mut Tree,
+        (dy, dx): (isize, isize),
+        extend: bool,
+        body: Rectangle,
+        shell: &mut Shell<'_, Message>,
+    ) -> bool {
+        let columns = self.columns.len();
+
+        if columns == 0 || self.row_count == 0 {
+            return false;
+        }
+
+        let step = |current: usize, delta: isize, count: usize| {
+            (current as isize + delta).clamp(0, count as isize - 1) as usize
+        };
+
+        let state = tree.state.downcast_mut::<State>();
+
+        if self.cell_mode != Mode::None {
+            // Step from the focus -- the end that moves -- not the anchor.
+            let from = state
+                .cell_focus
+                .or(state.cell_anchor)
+                .or_else(|| self.selected_cells.iter().next_back().copied())
+                .unwrap_or(CellPosition::new(0, 0));
+
+            let target = CellPosition::new(
+                step(from.row, dy, self.row_count),
+                step(from.column, dx, columns),
+            );
+
+            // Shift spans from the anchor and leaves it where it is; a plain
+            // arrow drags anchor and focus along together.
+            let anchor = if extend {
+                state.cell_anchor.or(Some(from))
+            } else {
+                Some(target)
+            };
+
+            let selection = if extend {
+                selection::rectangle(anchor.unwrap_or(target), target)
+            } else {
+                BTreeSet::from([target])
+            };
+
+            state.cell_anchor = anchor;
+            state.cell_focus = Some(target);
+            self.reveal_cell(state, body, target);
+
+            if selection != self.selected_cells {
+                if let Some(on_cell) = &self.on_select_cell {
+                    shell.publish(on_cell(selection));
+                }
+            }
+
+            self.clear_except(Target::Cell(target), shell);
+            return true;
+        }
+
+        // No cell selection, so the arrows drive rows. Left/right have nothing
+        // to move along and are left for whatever else wants them.
+        if self.mode != Mode::None && dy != 0 {
+            let from = state
+                .row_focus
+                .or(state.anchor)
+                .or_else(|| self.selected.iter().next_back().copied())
+                .unwrap_or(0);
+
+            let target = step(from, dy, self.row_count);
+
+            let anchor = if extend { state.anchor.or(Some(from)) } else { Some(target) };
+
+            let selection = if extend {
+                selection::span(anchor.unwrap_or(target), target)
+            } else {
+                BTreeSet::from([target])
+            };
+
+            state.anchor = anchor;
+            state.row_focus = Some(target);
+            self.reveal_row(state, body, target);
+
+            if selection != self.selected {
+                if let Some(on_rows) = &self.on_select {
+                    shell.publish(on_rows(selection));
+                }
+            }
+
+            self.clear_except(Target::Row(target), shell);
+            return true;
+        }
+
+        false
+    }
+
+    /// Clear the two readings of the grid that `target` is not.
+    ///
+    /// Rows, columns and cells are alternative views of the same data, and
+    /// holding two at once leaves nothing on screen to say which one an action
+    /// would apply to. The widget cannot mutate sets it does not own, so it
+    /// publishes empties instead -- guarded, to avoid a no-op every click.
+    fn clear_except(&self, target: Target, shell: &mut Shell<'_, Message>) {
+        if !matches!(target, Target::Cell(_)) && !self.selected_cells.is_empty() {
+            if let Some(on_cell) = &self.on_select_cell {
+                shell.publish(on_cell(BTreeSet::new()));
+            }
+        }
+
+        if !matches!(target, Target::Row(_)) && !self.selected.is_empty() {
+            if let Some(on_rows) = &self.on_select {
+                shell.publish(on_rows(BTreeSet::new()));
+            }
+        }
+
+        if !matches!(target, Target::Column(_)) && !self.selected_columns.is_empty() {
+            if let Some(on_columns) = &self.on_select_column {
+                shell.publish(on_columns(BTreeSet::new()));
+            }
+        }
+    }
+
+    /// Scroll the least amount that brings a row fully into view.
+    fn reveal_row(&self, state: &mut State, body: Rectangle, row: usize) {
+        let top = state.row_height * row as f32;
+        let bottom = top + state.row_height;
+
+        if top < state.offset.y {
+            state.offset.y = top;
+        } else if bottom > state.offset.y + body.height {
+            state.offset.y = bottom - body.height;
+        }
+
+        state.offset = scroll::clamp_offset(
+            state.offset,
+            Size::new(body.width, body.height),
+            state.content,
+        );
+    }
+
+    /// As [`reveal_row`](Self::reveal_row), plus the horizontal axis.
+    ///
+    /// Without this, arrowing past the edge of the viewport moves the selection
+    /// somewhere you cannot see, which reads as the keys having done nothing.
+    fn reveal_cell(&self, state: &mut State, body: Rectangle, cell: CellPosition) {
+        self.reveal_row(state, body, cell.row);
+
+        // A frozen column is on screen by definition. Scrolling to "reveal" one
+        // would haul the view back to the left edge for no reason.
+        if cell.column < self.sticky_columns || cell.column >= state.widths.len() {
+            return;
+        }
+
+        let left = state.offsets[cell.column];
+        let right = left + state.widths[cell.column];
+
+        // The scrolling band begins after the frozen strip, so the near edge of
+        // the visible window is pushed in by it while the far edge is not.
+        if left < state.offset.x + state.frozen_width {
+            state.offset.x = left - state.frozen_width;
+        } else if right > state.offset.x + body.width {
+            state.offset.x = right - body.width;
+        }
+
+        state.offset = scroll::clamp_offset(
+            state.offset,
+            Size::new(body.width, body.height),
+            state.content,
+        );
     }
 
     fn is_sortable(&self, cell: &HeaderCell) -> bool {
@@ -1440,12 +1814,17 @@ where
                 // The selected cell, last of the highlights and above the
                 // dividers: it is the most specific thing the grid can point
                 // at, so nothing else should be able to obscure it.
-                if let Some(position) = self.selected_cell.filter(|c| {
-                    c.row >= first
-                        && c.row < last
-                        && c.column < state.widths.len()
-                        && range.contains(&c.column)
-                }) {
+                //
+                // Only the visible rows: the set can hold every cell in the
+                // table after a sweep, and `CellPosition` sorts by row first,
+                // so the visible slice is one range query.
+                let visible_cells = self
+                    .selected_cells
+                    .range(CellPosition::new(first, 0)..CellPosition::new(last, 0))
+                    .copied()
+                    .filter(|c| c.column < state.widths.len() && range.contains(&c.column));
+
+                for position in visible_cells {
                     let band = cell_rect(position.row, position.column);
 
                     if let Some(background) = appearance.selected_cell_background {
@@ -1458,30 +1837,54 @@ where
                         );
                     }
 
+                    // An edge is drawn only where the neighbour on that side is
+                    // *not* selected, so any shape the selection takes comes out
+                    // outlined as one block rather than as a grid of boxed
+                    // cells with the internal edges doubled.
                     if let Some(color) = appearance.selected_cell_border {
+                        let selected = |row: usize, column: usize| {
+                            self.selected_cells
+                                .contains(&CellPosition::new(row, column))
+                        };
+
                         let edges = [
-                            Rectangle { height: rule, ..band },
-                            Rectangle {
-                                y: band.y + band.height - rule,
-                                height: rule,
-                                ..band
-                            },
-                            Rectangle { width: rule, ..band },
-                            Rectangle {
-                                x: band.x + band.width - rule,
-                                width: rule,
-                                ..band
-                            },
+                            (
+                                Rectangle { height: rule, ..band },
+                                position.row > 0 && selected(position.row - 1, position.column),
+                            ),
+                            (
+                                Rectangle {
+                                    y: band.y + band.height - rule,
+                                    height: rule,
+                                    ..band
+                                },
+                                selected(position.row + 1, position.column),
+                            ),
+                            (
+                                Rectangle { width: rule, ..band },
+                                position.column > 0
+                                    && selected(position.row, position.column - 1),
+                            ),
+                            (
+                                Rectangle {
+                                    x: band.x + band.width - rule,
+                                    width: rule,
+                                    ..band
+                                },
+                                selected(position.row, position.column + 1),
+                            ),
                         ];
 
-                        for edge in edges {
-                            renderer.fill_quad(
-                                renderer::Quad {
-                                    bounds: edge,
-                                    ..Default::default()
-                                },
-                                color,
-                            );
+                        for (edge, joined) in edges {
+                            if !joined {
+                                renderer.fill_quad(
+                                    renderer::Quad {
+                                        bounds: edge,
+                                        ..Default::default()
+                                    },
+                                    color,
+                                );
+                            }
                         }
                     }
                 }
@@ -1949,6 +2352,19 @@ where
             tree.state.downcast_mut::<State>().modifiers = *modifiers;
         }
 
+        // Click-to-focus. Arrow keys are delivered to every widget, so without
+        // a focus flag the table would fight everything else on the page for
+        // them. Tracked on press rather than on release so a click that starts
+        // a drag has already taken focus by the time the drag runs.
+        if let Event::Mouse(mouse::Event::ButtonPressed(_)) = event {
+            let focused = cursor.is_over(bounds);
+            let state = tree.state.downcast_mut::<State>();
+
+            if state.focused != focused {
+                state.focused = focused;
+            }
+        }
+
         let (header_height, row_height, content, offset) = {
             let state = tree.state.downcast_ref::<State>();
             (
@@ -2223,7 +2639,7 @@ where
                 // through to the row; a header click has no row and resolves to
                 // the column. Exactly the precedence a left-click follows.
                 let target = match (row, column) {
-                    (Some(row), Some(column)) if self.on_select_cell.is_some() => {
+                    (Some(row), Some(column)) if self.cell_mode != Mode::None => {
                         Some(Target::Cell(CellPosition::new(row, column)))
                     }
                     (Some(row), _) if self.mode != Mode::None => Some(Target::Row(row)),
@@ -2240,9 +2656,9 @@ where
                     // selected" silently narrows to one the moment the menu
                     // opens on it.
                     match target {
-                        Target::Cell(position) if self.selected_cell != Some(position) => {
+                        Target::Cell(position) if !self.selected_cells.contains(&position) => {
                             if let Some(on_cell) = &self.on_select_cell {
-                                shell.publish(on_cell(Some(position)));
+                                shell.publish(on_cell(BTreeSet::from([position])));
                             }
                         }
                         Target::Row(row) if !self.selected.contains(&row) => {
@@ -2258,27 +2674,7 @@ where
                         _ => {}
                     }
 
-                    // And clear the other two readings. A left-click already
-                    // does this; without it here, a menu can open on a cell
-                    // while a row is still lit, and nothing on screen says
-                    // which of them an action would apply to.
-                    if !matches!(target, Target::Cell(_)) && self.selected_cell.is_some() {
-                        if let Some(on_cell) = &self.on_select_cell {
-                            shell.publish(on_cell(None));
-                        }
-                    }
-
-                    if !matches!(target, Target::Row(_)) && !self.selected.is_empty() {
-                        if let Some(on_rows) = &self.on_select {
-                            shell.publish(on_rows(BTreeSet::new()));
-                        }
-                    }
-
-                    if !matches!(target, Target::Column(_)) && !self.selected_columns.is_empty() {
-                        if let Some(on_columns) = &self.on_select_column {
-                            shell.publish(on_columns(BTreeSet::new()));
-                        }
-                    }
+                    self.clear_except(target, shell);
                 }
 
                 shell.publish(on_right_click(Click {
@@ -2291,50 +2687,119 @@ where
             }
         }
 
-        // --- 4a. cell selection ---
+        // --- 4a. cell selection, and the sweep that any of the three kinds
+        // can be dragging ---
         //
-        // Ahead of row selection, and it only claims clicks that land *inside*
-        // a column. A click in a gutter finds no column and falls through --
+        // Cells go ahead of rows, and only claim clicks that land *inside* a
+        // column. A click in a gutter finds no column and falls through --
         // which is the whole point of the gutter, and the only reason row
         // selection still has somewhere to live once every cell is
         // individually selectable.
-        if let (
-            Some(on_select_cell),
-            Event::Mouse(mouse::Event::ButtonPressed(mouse::Button::Left)),
-        ) = (&self.on_select_cell, event)
-        {
-            if let Some(point) = cursor.position_over(body) {
-                let state = tree.state.downcast_ref::<State>();
+        if let Event::Mouse(mouse::Event::ButtonPressed(mouse::Button::Left)) = event {
+            if self.cell_mode != Mode::None {
+                if let Some(point) = cursor.position_over(body) {
+                    let hit = {
+                        let state = tree.state.downcast_ref::<State>();
 
-                let hit = scroll::row_at(point, body, offset.y, row_height, self.row_count)
-                    .zip(self.column_at(point, bounds, state));
+                        scroll::row_at(point, body, offset.y, row_height, self.row_count)
+                            .zip(self.column_at(point, bounds, state))
+                    };
 
-                if let Some((row, column)) = hit {
-                    let position = CellPosition::new(row, column);
+                    if let Some((row, column)) = hit {
+                        let target = CellPosition::new(row, column);
+                        let state = tree.state.downcast_mut::<State>();
+                        let modifiers = state.modifiers;
 
-                    // Guarded so re-clicking the same cell is not an endless
-                    // stream of identical messages.
-                    if self.selected_cell != Some(position) {
-                        shell.publish(on_select_cell(Some(position)));
+                        let outcome = selection::apply_cells(
+                            self.cell_mode,
+                            &self.selected_cells,
+                            state.cell_anchor,
+                            target,
+                            modifiers.command(),
+                            modifiers.shift(),
+                        );
+
+                        // The anchor has to move even when the selection did
+                        // not change, or a plain click on the one already
+                        // selected cell leaves the next Shift-click measuring
+                        // from wherever the anchor last happened to be.
+                        let selection = outcome
+                            .as_ref()
+                            .map(|outcome| outcome.selection.clone())
+                            .unwrap_or_else(|| self.selected_cells.clone());
+
+                        state.cell_anchor = outcome
+                            .as_ref()
+                            .and_then(|outcome| outcome.anchor)
+                            .or(Some(target));
+
+                        // The click *is* the new moving end, so a Shift+arrow
+                        // straight afterwards carries on from where the pointer
+                        // left off rather than from the anchor.
+                        state.cell_focus = Some(target);
+
+                        state.drag = Some(Drag {
+                            kind: DragKind::Cell,
+                            base: DragBase::Cells(if modifiers.command() {
+                                selection.clone()
+                            } else {
+                                BTreeSet::new()
+                            }),
+                        });
+
+                        if let Some(outcome) = outcome {
+                            if let Some(on_cell) = &self.on_select_cell {
+                                shell.publish(on_cell(outcome.selection));
+                            }
+                        }
+
+                        self.clear_except(Target::Cell(target), shell);
+                        shell.capture_event();
+                        shell.request_redraw();
+                        return;
                     }
+                }
+            }
+        }
 
-                    for message in [
-                        (!self.selected.is_empty())
-                            .then(|| self.on_select.as_ref().map(|f| f(BTreeSet::new())))
-                            .flatten(),
-                        (!self.selected_columns.is_empty())
-                            .then(|| self.on_select_column.as_ref().map(|f| f(BTreeSet::new())))
-                            .flatten(),
-                    ]
-                    .into_iter()
-                    .flatten()
-                    {
-                        shell.publish(message);
+        if self.sweep(tree, event, bounds, body, cursor, row_height, offset, shell) {
+            return;
+        }
+
+        // --- 4b. keyboard navigation ---
+        if let Event::Keyboard(keyboard::Event::KeyPressed { key, modifiers, .. }) = event {
+            if tree.state.downcast_ref::<State>().focused {
+                // `command()` is Cmd on macOS and Ctrl everywhere else, so the
+                // platform difference is already handled.
+                let copying = modifiers.command()
+                    && matches!(key, keyboard::Key::Character(c) if c.eq_ignore_ascii_case("c"));
+
+                if copying {
+                    let empty = self.selected_cells.is_empty()
+                        && self.selected.is_empty()
+                        && self.selected_columns.is_empty();
+
+                    if let (false, Some(on_copy)) = (empty, &self.on_copy) {
+                        shell.publish(on_copy());
+                        shell.capture_event();
+                        return;
                     }
+                }
 
-                    shell.capture_event();
-                    shell.request_redraw();
-                    return;
+                let delta = match key {
+                    keyboard::Key::Named(keyboard::key::Named::ArrowUp) => Some((-1, 0)),
+                    keyboard::Key::Named(keyboard::key::Named::ArrowDown) => Some((1, 0)),
+                    keyboard::Key::Named(keyboard::key::Named::ArrowLeft) => Some((0, -1)),
+                    keyboard::Key::Named(keyboard::key::Named::ArrowRight) => Some((0, 1)),
+                    _ => None,
+                };
+
+                if let Some(delta) = delta {
+                    if self.move_focus(tree, delta, modifiers.shift(), body, shell) {
+                        shell.capture_event();
+                        shell.request_redraw();
+                        return;
+                    }
                 }
             }
         }
@@ -2370,29 +2835,22 @@ where
                             modifiers.command(),
                             modifiers.shift(),
                         ) {
-                            state.anchor = outcome.anchor;
+                            state.anchor = outcome.anchor.or(Some(row));
+                            state.row_focus = Some(row);
+                            state.drag = Some(Drag {
+                                kind: DragKind::Row,
+                                base: DragBase::Linear(if modifiers.command() {
+                                    outcome.selection.clone()
+                                } else {
+                                    BTreeSet::new()
+                                }),
+                            });
 
                             if let Some(on_select) = &self.on_select {
                                 shell.publish(on_select(outcome.selection));
                             }
 
-                            // Rows and columns are alternative readings of the
-                            // same grid, so selecting one clears the other.
-                            // The widget cannot mutate a set it does not own,
-                            // so it publishes a second message instead --
-                            // guarded, to avoid emitting a no-op every click.
-                            if !self.selected_columns.is_empty() {
-                                if let Some(on_columns) = &self.on_select_column {
-                                    shell.publish(on_columns(BTreeSet::new()));
-                                }
-                            }
-
-                            if self.selected_cell.is_some() {
-                                if let Some(on_cell) = &self.on_select_cell {
-                                    shell.publish(on_cell(None));
-                                }
-                            }
-
+                            self.clear_except(Target::Row(row), shell);
                             shell.capture_event();
                             shell.request_redraw();
                             return;
@@ -2497,24 +2955,22 @@ where
                     };
 
                     if let Some(outcome) = outcome {
-                        state.column_anchor = outcome.anchor;
+                        state.column_anchor = outcome.anchor.or(Some(cell.start));
+                        state.column_focus = Some(cell.end);
+                        state.drag = Some(Drag {
+                            kind: DragKind::Column,
+                            base: DragBase::Linear(if toggle {
+                                outcome.selection.clone()
+                            } else {
+                                BTreeSet::new()
+                            }),
+                        });
 
                         if let Some(on_select) = &self.on_select_column {
                             shell.publish(on_select(outcome.selection));
                         }
 
-                        if !self.selected.is_empty() {
-                            if let Some(on_rows) = &self.on_select {
-                                shell.publish(on_rows(BTreeSet::new()));
-                            }
-                        }
-
-                        if self.selected_cell.is_some() {
-                            if let Some(on_cell) = &self.on_select_cell {
-                                shell.publish(on_cell(None));
-                            }
-                        }
-
+                        self.clear_except(Target::Column(cell.start), shell);
                         shell.capture_event();
                         shell.request_redraw();
                         return;

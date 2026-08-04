@@ -52,38 +52,104 @@ impl CellPosition {
 
 /// What a click should produce.
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct Outcome {
-    pub selection: BTreeSet<usize>,
+pub struct Outcome<T = usize> {
+    pub selection: BTreeSet<T>,
     /// The new anchor, for a later Shift-click to extend from.
-    pub anchor: Option<usize>,
+    pub anchor: Option<T>,
+}
+
+/// Every item between two anchors, for a linear axis -- rows or columns.
+pub fn span(a: usize, b: usize) -> BTreeSet<usize> {
+    (a.min(b)..=a.max(b)).collect()
+}
+
+/// Every cell in the rectangle two corners describe.
+///
+/// A cell range is genuinely a *rectangle*, not the run of cells you would get
+/// by reading left-to-right top-to-bottom between the two corners. Dragging
+/// from B2 to D4 selects nine cells, not the eleven that lie between them in
+/// reading order -- which is why cells cannot reuse [`span`].
+pub fn rectangle(a: CellPosition, b: CellPosition) -> BTreeSet<CellPosition> {
+    let rows = a.row.min(b.row)..=a.row.max(b.row);
+    let columns = a.column.min(b.column)..=a.column.max(b.column);
+
+    rows.flat_map(|row| {
+        columns
+            .clone()
+            .map(move |column| CellPosition::new(row, column))
+    })
+    .collect()
+}
+
+/// Lay a cell selection out as the rectangle enclosing it, in reading order.
+///
+/// Spreadsheets exchange a **rectangle**: tabs between columns, newlines
+/// between rows. A selection built with Ctrl-clicks is not necessarily
+/// rectangular, so the bounding box is squared off and the positions that were
+/// never selected come back as `None` -- write those as empty strings and the
+/// paste still lands in the right shape.
+///
+/// The table cannot do the copying itself: it only ever sees the `Element` you
+/// built from a value, never the value. What it can do is hand you the shape,
+/// which is the part that is fiddly to get right.
+pub fn grid(selection: &BTreeSet<CellPosition>) -> Vec<Vec<Option<CellPosition>>> {
+    let Some(first) = selection.iter().next() else {
+        return Vec::new();
+    };
+
+    let (mut top, mut bottom) = (first.row, first.row);
+    let (mut left, mut right) = (first.column, first.column);
+
+    for cell in selection {
+        top = top.min(cell.row);
+        bottom = bottom.max(cell.row);
+        left = left.min(cell.column);
+        right = right.max(cell.column);
+    }
+
+    (top..=bottom)
+        .map(|row| {
+            (left..=right)
+                .map(|column| {
+                    let cell = CellPosition::new(row, column);
+
+                    selection.contains(&cell).then_some(cell)
+                })
+                .collect()
+        })
+        .collect()
 }
 
 /// Resolve a click into a new selection.
 ///
 /// Returns `None` when nothing should change, so the caller can skip emitting
 /// a message rather than spamming identical updates.
-pub fn apply(
+///
+/// `span` is what an extend (Shift) covers between the anchor and the target.
+/// It is the only thing that differs between rows, columns and cells, so all
+/// three share this one implementation and cannot drift apart in behaviour.
+pub fn resolve<T: Ord + Copy>(
     mode: Mode,
-    current: &BTreeSet<usize>,
-    anchor: Option<usize>,
-    row: usize,
+    current: &BTreeSet<T>,
+    anchor: Option<T>,
+    target: T,
     toggle: bool,
     extend: bool,
-) -> Option<Outcome> {
+    span: impl Fn(T, T) -> BTreeSet<T>,
+) -> Option<Outcome<T>> {
     let outcome = match mode {
         Mode::None => return None,
 
         Mode::Single => Outcome {
-            selection: BTreeSet::from([row]),
-            anchor: Some(row),
+            selection: BTreeSet::from([target]),
+            anchor: Some(target),
         },
 
         Mode::Multiple => {
             if extend {
                 // Shift extends from the anchor. Without an anchor there is
                 // nothing to extend from, so it degrades to a plain click.
-                let start = anchor.unwrap_or(row);
-                let range = (start.min(row)..=start.max(row)).collect::<BTreeSet<_>>();
+                let range = span(anchor.unwrap_or(target), target);
 
                 Outcome {
                     selection: if toggle {
@@ -100,18 +166,18 @@ pub fn apply(
             } else if toggle {
                 let mut selection = current.clone();
 
-                if !selection.remove(&row) {
-                    selection.insert(row);
+                if !selection.remove(&target) {
+                    selection.insert(target);
                 }
 
                 Outcome {
                     selection,
-                    anchor: Some(row),
+                    anchor: Some(target),
                 }
             } else {
                 Outcome {
-                    selection: BTreeSet::from([row]),
-                    anchor: Some(row),
+                    selection: BTreeSet::from([target]),
+                    anchor: Some(target),
                 }
             }
         }
@@ -121,6 +187,156 @@ pub fn apply(
         None
     } else {
         Some(outcome)
+    }
+}
+
+/// [`resolve`] for a linear axis -- rows or columns.
+pub fn apply(
+    mode: Mode,
+    current: &BTreeSet<usize>,
+    anchor: Option<usize>,
+    row: usize,
+    toggle: bool,
+    extend: bool,
+) -> Option<Outcome> {
+    resolve(mode, current, anchor, row, toggle, extend, span)
+}
+
+/// [`resolve`] for cells, where an extend covers a rectangle.
+pub fn apply_cells(
+    mode: Mode,
+    current: &BTreeSet<CellPosition>,
+    anchor: Option<CellPosition>,
+    target: CellPosition,
+    toggle: bool,
+    extend: bool,
+) -> Option<Outcome<CellPosition>> {
+    resolve(mode, current, anchor, target, toggle, extend, rectangle)
+}
+
+#[cfg(test)]
+mod cell_tests {
+    use super::*;
+
+    fn at(row: usize, column: usize) -> CellPosition {
+        CellPosition::new(row, column)
+    }
+
+    #[test]
+    fn extending_covers_a_rectangle_not_a_reading_order_run() {
+        let outcome = apply_cells(
+            Mode::Multiple,
+            &BTreeSet::from([at(1, 1)]),
+            Some(at(1, 1)),
+            at(3, 2),
+            false,
+            true,
+        )
+        .unwrap();
+
+        // Rows 1..=3 x columns 1..=2 -- six cells. Reading order between the
+        // two corners would have given eight.
+        assert_eq!(outcome.selection.len(), 6);
+        assert!(outcome.selection.contains(&at(2, 1)));
+        assert!(outcome.selection.contains(&at(3, 2)));
+        assert!(!outcome.selection.contains(&at(2, 0)));
+        assert!(!outcome.selection.contains(&at(2, 3)));
+    }
+
+    #[test]
+    fn grid_squares_off_a_ragged_selection_and_marks_the_holes() {
+        // Two Ctrl-clicked cells on a diagonal. Pasting needs a 2x2 block with
+        // the off-diagonal left blank, not a two-cell run.
+        let selection = BTreeSet::from([at(3, 1), at(4, 2)]);
+        let grid = grid(&selection);
+
+        assert_eq!(grid.len(), 2);
+        assert_eq!(grid[0], vec![Some(at(3, 1)), None]);
+        assert_eq!(grid[1], vec![None, Some(at(4, 2))]);
+    }
+
+    #[test]
+    fn grid_of_a_swept_rectangle_has_no_holes() {
+        let grid = grid(&rectangle(at(2, 1), at(4, 3)));
+
+        assert_eq!(grid.len(), 3);
+        assert!(grid.iter().all(|row| row.len() == 3));
+        assert!(grid.iter().flatten().all(Option::is_some));
+    }
+
+    #[test]
+    fn grid_of_nothing_is_nothing() {
+        assert!(grid(&BTreeSet::new()).is_empty());
+    }
+
+    #[test]
+    fn a_rectangle_is_the_same_whichever_corner_you_start_from() {
+        let forward = rectangle(at(1, 1), at(3, 4));
+        let backward = rectangle(at(3, 4), at(1, 1));
+
+        assert_eq!(forward, backward);
+        assert_eq!(forward.len(), 12);
+    }
+
+    #[test]
+    fn ctrl_toggles_one_cell_and_leaves_the_rest() {
+        let current = BTreeSet::from([at(0, 0), at(5, 2)]);
+
+        let added = apply_cells(Mode::Multiple, &current, None, at(9, 1), true, false).unwrap();
+        assert_eq!(added.selection.len(), 3);
+        assert!(added.selection.contains(&at(9, 1)));
+
+        let removed =
+            apply_cells(Mode::Multiple, &current, None, at(5, 2), true, false).unwrap();
+        assert_eq!(removed.selection, BTreeSet::from([at(0, 0)]));
+    }
+
+    #[test]
+    fn ctrl_shift_unions_a_second_block_onto_the_first() {
+        let current = rectangle(at(0, 0), at(1, 1));
+
+        let outcome =
+            apply_cells(Mode::Multiple, &current, Some(at(5, 0)), at(6, 1), true, true).unwrap();
+
+        // Both blocks survive: four cells each, none shared.
+        assert_eq!(outcome.selection.len(), 8);
+        assert!(outcome.selection.contains(&at(0, 0)));
+        assert!(outcome.selection.contains(&at(6, 1)));
+    }
+
+    #[test]
+    fn single_mode_ignores_modifiers() {
+        for (toggle, extend) in [(true, false), (false, true), (true, true)] {
+            let outcome = apply_cells(
+                Mode::Single,
+                &BTreeSet::from([at(0, 0)]),
+                Some(at(0, 0)),
+                at(4, 3),
+                toggle,
+                extend,
+            )
+            .unwrap();
+
+            assert_eq!(outcome.selection, BTreeSet::from([at(4, 3)]));
+        }
+    }
+
+    #[test]
+    fn repeated_shift_drags_all_measure_from_the_same_anchor() {
+        // This is what a drag is: the anchor is fixed at the press and every
+        // move re-resolves against it. If the anchor walked forward, dragging
+        // back over your own path would leave cells behind.
+        let anchor = at(2, 2);
+        let mut selection = BTreeSet::from([anchor]);
+
+        for target in [at(4, 4), at(6, 5), at(3, 3)] {
+            let outcome =
+                apply_cells(Mode::Multiple, &selection, Some(anchor), target, false, true).unwrap();
+
+            assert_eq!(outcome.selection, rectangle(anchor, target));
+            assert_eq!(outcome.anchor, Some(anchor));
+            selection = outcome.selection;
+        }
     }
 }
 

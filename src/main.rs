@@ -56,7 +56,24 @@ use iced::{alignment, Color, Element, Fill, Length, Task};
 /// 16. Turn on "Cell selection". Clicking any cell must select just that cell,
 ///     and the only place left that still selects a row is the gutter at either
 ///     edge. Right-click anywhere and the status line names what was under it.
+/// 17. Drag across cells: a rectangle sweeps out live, and dragging back toward
+///     the start gives ground back rather than only ever growing. Ctrl-drag
+///     adds a second block without disturbing the first. The same gesture must
+///     work on rows (drag down the gutter) and columns (drag across headers).
+/// 18. Click a cell, then arrow around. The selection follows, and arrowing
+///     past the viewport edge scrolls just enough to keep it visible. Shift plus
+///     arrows grows a rectangle from the anchor instead of moving it. Click
+///     outside the table first and the arrows must do nothing.
+/// 19. Hold Shift and press an arrow repeatedly. The block must keep growing
+///     one step per press, in the direction pressed -- not snap back to two
+///     items. Reverse direction and it shrinks back through the anchor.
+/// 20. Select a block and press Ctrl+C, then paste into a spreadsheet. Columns
+///     land in columns and rows in rows. Ctrl-click a ragged set and the paste
+///     still arrives as a rectangle with the gaps blank.
 const CHECKS: () = ();
+
+/// Leaf columns carrying data. "Actions" holds buttons, so it is not one.
+const COLUMNS: usize = 7;
 
 fn main() -> iced::Result {
     iced::run(Demo::update, Demo::view)
@@ -131,7 +148,8 @@ enum Message {
     RightClicked(Click),
     ToggleCells(bool),
     ToggleSticky(bool),
-    CellChanged(Option<CellPosition>),
+    CellsChanged(BTreeSet<CellPosition>),
+    Copy,
 }
 
 struct Demo {
@@ -144,7 +162,7 @@ struct Demo {
     cells: bool,
     sticky: bool,
     sort: Option<Sort>,
-    selected_cell: Option<CellPosition>,
+    selected_cells: BTreeSet<CellPosition>,
     selected: BTreeSet<usize>,
     selected_columns: BTreeSet<usize>,
     status: String,
@@ -162,7 +180,7 @@ impl Default for Demo {
             cells: false,
             sticky: true,
             sort: None,
-            selected_cell: None,
+            selected_cells: BTreeSet::new(),
             selected: BTreeSet::new(),
             selected_columns: BTreeSet::new(),
             status: String::from("no row clicked yet"),
@@ -204,6 +222,67 @@ impl Demo {
             .collect();
 
         self.resort();
+    }
+
+    /// One cell's value as text. The table never sees these -- it only holds
+    /// the `Element` built from them -- so producing them for the clipboard is
+    /// necessarily the application's job.
+    fn value(&self, row: usize, column: usize) -> String {
+        let Some(record) = self.records.get(row) else {
+            return String::new();
+        };
+
+        match column {
+            0 => record.id.to_string(),
+            1 => record.first.to_string(),
+            2 => record.last.to_string(),
+            3 => record.q3_revenue.to_string(),
+            4 => record.q3_cost.to_string(),
+            5 => record.q4_revenue.to_string(),
+            6 => record.q4_cost.to_string(),
+            _ => String::new(),
+        }
+    }
+
+    /// Whatever is selected, as the tab/newline text a spreadsheet pastes.
+    fn clipboard_text(&self) -> String {
+        let rows: Vec<Vec<String>> = if !self.selected_cells.is_empty() {
+            // `grid` squares a ragged Ctrl-clicked selection off into the
+            // rectangle a paste needs, marking the holes.
+            advanced_table::selection::grid(&self.selected_cells)
+                .into_iter()
+                .map(|row| {
+                    row.into_iter()
+                        .map(|cell| {
+                            cell.map(|c| self.value(c.row, c.column)).unwrap_or_default()
+                        })
+                        .collect()
+                })
+                .collect()
+        } else if !self.selected.is_empty() {
+            // A whole row means every column of it.
+            self.selected
+                .iter()
+                .map(|&row| (0..COLUMNS).map(|c| self.value(row, c)).collect())
+                .collect()
+        } else if !self.selected_columns.is_empty() {
+            (0..self.records.len())
+                .map(|row| {
+                    self.selected_columns
+                        .iter()
+                        .map(|&column| self.value(row, column))
+                        .collect()
+                })
+                .collect()
+        } else {
+            Vec::new()
+        };
+
+        rows.into_iter()
+            .map(|row| row.join("	"))
+            .collect::<Vec<_>>()
+            .join("
+")
     }
 
     /// The table reports what the sort should become; putting the rows in that
@@ -280,16 +359,28 @@ impl Demo {
             // A real app would open a context menu here, positioned at
             // `click.position`. The status line stands in for it.
             Message::ToggleSticky(sticky) => self.sticky = sticky,
+            Message::Copy => {
+                let text = self.clipboard_text();
+
+                if !text.is_empty() {
+                    self.status = format!("copied {} lines", text.lines().count());
+                    return iced::clipboard::write(text).discard();
+                }
+            }
             Message::ToggleCells(cells) => {
                 self.cells = cells;
-                self.selected_cell = None;
+                self.selected_cells.clear();
             }
-            Message::CellChanged(cell) => {
-                self.status = match cell {
-                    Some(cell) => format!("selected cell ({}, {})", cell.row, cell.column),
-                    None => "no cell selected".to_string(),
+            Message::CellsChanged(cells) => {
+                self.status = match cells.len() {
+                    0 => "no cells selected".to_string(),
+                    1 => {
+                        let cell = cells.iter().next().unwrap();
+                        format!("selected cell ({}, {})", cell.row, cell.column)
+                    }
+                    n => format!("selected {n} cells"),
                 };
-                self.selected_cell = cell;
+                self.selected_cells = cells;
             }
             Message::RightClicked(click) => {
                 self.status = match (click.row, click.column) {
@@ -448,6 +539,7 @@ impl Demo {
             )
             .sorting(self.sort, Message::SortChanged)
             .on_right_click(Message::RightClicked)
+            .on_copy(|| Message::Copy)
             .overflow(match self.overflow {
                 OverflowChoice::Scroll => Overflow::Scroll,
                 OverflowChoice::Shrink => Overflow::Shrink,
@@ -510,7 +602,11 @@ impl Demo {
         // this take row selection away?" question can be answered by flipping
         // one checkbox: with it on, only the gutters still select a row.
         if self.cells {
-            table = table.cell_selection(self.selected_cell, Message::CellChanged);
+            table = table.cell_selection(
+                SelectionMode::Multiple,
+                &self.selected_cells,
+                Message::CellsChanged,
+            );
         }
 
         column![
