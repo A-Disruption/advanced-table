@@ -14,6 +14,8 @@ use crate::sizing::Sizing;
 pub struct ColumnSpec {
     pub sizing: Sizing,
     pub align: alignment::Horizontal,
+    /// Draw a sort control in this column's header and let it be clicked.
+    pub sortable: bool,
 }
 
 impl Default for ColumnSpec {
@@ -21,6 +23,7 @@ impl Default for ColumnSpec {
         Self {
             sizing: Sizing::default(),
             align: alignment::Horizontal::Left,
+            sortable: false,
         }
     }
 }
@@ -33,6 +36,11 @@ impl ColumnSpec {
 
     pub fn align(mut self, align: alignment::Horizontal) -> Self {
         self.align = align;
+        self
+    }
+
+    pub fn sortable(mut self, sortable: bool) -> Self {
+        self.sortable = sortable;
         self
     }
 }
@@ -87,6 +95,15 @@ impl<'a, Message, Theme, Renderer> HeaderNode<'a, Message, Theme, Renderer> {
         self
     }
 
+    /// Give this column a sort control. No-op on a group -- a group spans
+    /// several columns and there is no single ordering it could stand for.
+    pub fn sortable(mut self) -> Self {
+        if let NodeKind::Leaf(spec) = &mut self.kind {
+            spec.sortable = true;
+        }
+        self
+    }
+
     pub fn fill(self, weight: u16) -> Self {
         self.sizing(Sizing::Fill { weight, min: 48.0 })
     }
@@ -105,15 +122,38 @@ pub struct HeaderCell {
     pub start: usize,
     /// Last leaf column covered, inclusive.
     pub end: usize,
-    /// Header row this cell begins on, 0 = topmost.
+    /// Header row this cell's *label* sits on, 0 = topmost.
     pub row: usize,
-    /// How many header rows this cell occupies.
+    /// How many header rows the label band occupies.
     pub row_span: usize,
+    /// Topmost row this cell owns.
+    ///
+    /// Differs from [`row`](Self::row) only for a group that was pushed down to
+    /// meet shallower children: the blank band above it still belongs to it, so
+    /// its dividers, its background and its hit box all start here rather than
+    /// at the label. Without this the blank bands are owned by nobody, which is
+    /// what leaves the header looking like a grid with pieces missing.
+    pub top: usize,
+    /// True for a real column. Deliberately not derived from `start == end` --
+    /// a group with a single child covers one column and would be mistaken for
+    /// the column itself.
+    pub leaf: bool,
 }
 
 impl HeaderCell {
     pub fn is_leaf(&self) -> bool {
-        self.start == self.end
+        self.leaf
+    }
+
+    /// Row just past the bottom of the label band.
+    pub fn bottom(&self) -> usize {
+        self.row + self.row_span
+    }
+
+    /// Does this cell own `row`? Counts the blank band above a group that was
+    /// pushed down, which is why it starts at `top` rather than `row`.
+    pub fn covers(&self, row: usize) -> bool {
+        row >= self.top && row < self.bottom()
     }
 }
 
@@ -129,15 +169,19 @@ pub struct Flattened<'a, Message, Theme, Renderer> {
 /// the whole thing tractable: after this point nothing downstream knows or
 /// cares that groups exist.
 ///
-/// Every node is placed at `total_rows - subtree_depth`, which pushes each
-/// branch **down** so it sits directly on top of its children and leaves the
-/// blank space at the top. Placing by distance-from-root instead strands a
-/// group at the top with an empty band between it and the columns it labels,
-/// which reads as though the group belongs to some other level entirely.
+/// Groups are placed at `total_rows - subtree_depth`, which pushes each branch
+/// **down** so it sits directly on top of its children and leaves the blank
+/// space at the top. Placing by distance-from-root instead strands a group at
+/// the top with an empty band between it and the columns it labels, which reads
+/// as though the group belongs to some other level entirely.
 ///
-/// A consequence is that every cell occupies exactly one row: children always
-/// fill the row immediately below their parent, so nothing needs to span
-/// downward to reach the body.
+/// Leaves are the other way round: a leaf claims every row from where its
+/// parent stops all the way down to the body. An ungrouped column in a
+/// three-level header is therefore *one* cell three rows tall, not a label on
+/// the bottom band with two rows of unowned blank above it. That is what makes
+/// its column rule run the full height of the header, its background cover the
+/// full height, and a click anywhere in the stack select the column -- the
+/// three things that separate a real data grid from a stack of labels.
 pub fn flatten<'a, Message, Theme, Renderer>(
     nodes: Vec<HeaderNode<'a, Message, Theme, Renderer>>,
 ) -> Flattened<'a, Message, Theme, Renderer> {
@@ -151,7 +195,7 @@ pub fn flatten<'a, Message, Theme, Renderer>(
     };
 
     for node in nodes {
-        walk(node, depth, &mut out);
+        walk(node, depth, 0, &mut out);
     }
 
     out
@@ -164,15 +208,19 @@ fn max_depth<Message, Theme, Renderer>(node: &HeaderNode<'_, Message, Theme, Ren
     }
 }
 
+/// `natural` is the row the node would sit on counting plainly down from the
+/// root -- the row immediately below its parent's label.
 fn walk<'a, Message, Theme, Renderer>(
     node: HeaderNode<'a, Message, Theme, Renderer>,
     total_rows: usize,
+    natural: usize,
     out: &mut Flattened<'a, Message, Theme, Renderer>,
 ) -> (usize, usize) {
     let element = out.elements.len();
     // Bottom-anchored: a subtree three deep starts at the top, one deep sits
-    // on the last row.
-    let row = total_rows.saturating_sub(max_depth(&node));
+    // on the last row. Never above `natural`, or a shallow group would climb
+    // past its own parent.
+    let row = total_rows.saturating_sub(max_depth(&node)).max(natural);
 
     out.elements.push(node.content);
 
@@ -184,8 +232,13 @@ fn walk<'a, Message, Theme, Renderer>(
                 element,
                 start: index,
                 end: index,
-                row,
-                row_span: 1,
+                // Leaves bottom out against the body rather than floating on
+                // the last band, so the cell covers everything its parent
+                // left over.
+                row: natural,
+                row_span: total_rows.saturating_sub(natural).max(1),
+                top: natural,
+                leaf: true,
             });
             (index, index)
         }
@@ -200,6 +253,8 @@ fn walk<'a, Message, Theme, Renderer>(
                 end: 0,
                 row,
                 row_span: 1,
+                top: natural,
+                leaf: false,
             });
 
             let mut start = usize::MAX;
@@ -210,7 +265,10 @@ fn walk<'a, Message, Theme, Renderer>(
                 // accounts for depth via the subtree height, so decrementing
                 // here counts it twice and collapses every deeper level onto
                 // row zero, stacking group labels on top of their own leaves.
-                let (s, e) = walk(child, total_rows, out);
+                // Children hang off the row this group's *label* landed on,
+                // not off `natural` -- a group pushed down to meet its
+                // children has to take them with it.
+                let (s, e) = walk(child, total_rows, row + 1, out);
                 start = start.min(s);
                 end = end.max(e);
             }
@@ -265,24 +323,41 @@ mod tests {
 
         let group_cell = f.cells.iter().find(|c| !c.is_leaf()).unwrap();
         assert_eq!((group_cell.start, group_cell.end), (1, 2));
-        assert_eq!(group_cell.row, 0);
 
         // The group sits directly on top of its children, not at the root.
         assert_eq!(group_cell.row, 0);
 
-        // The ungrouped leaf drops to the bottom row alongside Email/Phone,
-        // leaving the blank band above it rather than below.
+        // The ungrouped leaf owns the whole header stack rather than sitting
+        // on the last band under an orphaned blank.
         let name = f.cells.iter().find(|c| c.start == 0 && c.is_leaf()).unwrap();
-        assert_eq!(name.row, 1);
-        assert_eq!(name.row_span, 1);
+        assert_eq!(name.row, 0);
+        assert_eq!(name.row_span, 2);
     }
 
     #[test]
-    fn no_two_cells_in_a_row_ever_overlap() {
-        // The failure this guards against is subtle to read but obvious on
-        // screen: labels from different levels stacked on the same band,
-        // drawn over each other. It only shows up with three levels and a
-        // shallow sibling, so the simpler tests above all pass without it.
+    fn a_single_child_group_is_not_mistaken_for_a_leaf() {
+        // `start == end` is true of both, which is why the flag is explicit.
+        // Getting this wrong aligns the group label over its one column like a
+        // column header and lets a click on it fall through to the leaf.
+        let f = flatten(vec![group(
+            iced::widget::text("Solo"),
+            vec![text_leaf("Only")],
+        )]);
+
+        let solo = f.cells.iter().find(|c| c.row == 0).unwrap();
+        assert!(!solo.is_leaf());
+        assert_eq!((solo.start, solo.end), (0, 0));
+
+        let only = f.cells.iter().find(|c| c.row == 1).unwrap();
+        assert!(only.is_leaf());
+    }
+
+    #[test]
+    fn every_header_band_is_tiled_exactly_once() {
+        // Two failures at once, both obvious on screen and neither obvious in
+        // the code. Overlap: labels from different levels drawn over each
+        // other. Gaps: blank bands owned by nobody, which is what leaves the
+        // column rules stopping short and the group backgrounds ragged.
         let f = flatten(vec![
             text_leaf("ID"),
             group(
@@ -309,7 +384,7 @@ mod tests {
         assert_eq!(f.columns.len(), 8);
 
         for row in 0..f.rows {
-            let mut band: Vec<_> = f.cells.iter().filter(|c| c.row == row).collect();
+            let mut band: Vec<_> = f.cells.iter().filter(|c| c.covers(row)).collect();
             band.sort_by_key(|c| c.start);
 
             for pair in band.windows(2) {
@@ -320,11 +395,20 @@ mod tests {
                     (pair[1].start, pair[1].end),
                 );
             }
+
+            assert_eq!(
+                band.iter().map(|c| c.end - c.start + 1).sum::<usize>(),
+                f.columns.len(),
+                "row {row} does not cover every column",
+            );
         }
 
-        // Exactly one cell on the top band, and every leaf on the last.
-        assert_eq!(f.cells.iter().filter(|c| c.row == 0).count(), 1);
-        assert!(f.cells.iter().filter(|c| c.is_leaf()).all(|c| c.row == 2));
+        // Every leaf reaches the body, whatever level it branched off at.
+        assert!(f.cells.iter().filter(|c| c.is_leaf()).all(|c| c.bottom() == 3));
+
+        // ID and Actions are ungrouped, so they are full-height cells.
+        let id = f.cells.iter().find(|c| c.is_leaf() && c.start == 0).unwrap();
+        assert_eq!((id.row, id.row_span), (0, 3));
     }
 
     #[test]
@@ -354,11 +438,18 @@ mod tests {
         let financials = f.cells.iter().find(|c| c.start == 3 && c.end == 4).unwrap();
         assert_eq!(financials.row, 0);
 
-        // Every leaf lands on the last row.
+        // The blank band above Contact still belongs to Contact, so nothing in
+        // the header is unowned.
+        assert_eq!(contact.top, 0);
+
+        // Every leaf bottoms out against the body.
         for cell in f.cells.iter().filter(|c| c.is_leaf()) {
-            assert_eq!(cell.row, 2, "leaves bottom out against the body");
-            assert_eq!(cell.row_span, 1);
+            assert_eq!(cell.bottom(), 3, "leaves bottom out against the body");
         }
+
+        // First/Last hang off Contact's *label* row, not off the root.
+        let first = f.cells.iter().find(|c| c.is_leaf() && c.start == 1).unwrap();
+        assert_eq!((first.row, first.row_span), (2, 1));
     }
 
     #[test]
@@ -380,7 +471,7 @@ mod tests {
         let outer = f.cells.iter().find(|c| c.row == 0).unwrap();
         assert_eq!((outer.start, outer.end), (0, 2));
 
-        let q3 = f.cells.iter().find(|c| c.row == 1 && c.start == 0).unwrap();
+        let q3 = f.cells.iter().find(|c| !c.is_leaf() && c.row == 1 && c.start == 0).unwrap();
         assert_eq!((q3.start, q3.end), (0, 1));
 
         // Q4 has only one leaf, and every leaf sits on the bottom row.

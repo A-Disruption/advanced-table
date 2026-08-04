@@ -3,12 +3,14 @@
 //! Each control here targets something that is hard to verify by reading the
 //! code. Notes on what to actually look for are in `CHECKS` below.
 
-use advanced_table::{group, leaf, DataTable, Overflow, Policy, SelectionMode, Sizing};
+use advanced_table::{
+    group, leaf, CellStyle, DataTable, Direction, Overflow, Policy, SelectionMode, Sizing, Sort,
+};
 
 use std::collections::BTreeSet;
 
 use iced::widget::{button, checkbox, column, container, pick_list, row, text};
-use iced::{alignment, Element, Fill, Length, Task};
+use iced::{alignment, Color, Element, Fill, Length, Task};
 
 /// What to look at once it runs:
 ///
@@ -32,6 +34,22 @@ use iced::{alignment, Element, Fill, Length, Task};
 /// 8. Drag the window narrow. With Scroll, columns keep their width and a
 ///    horizontal bar appears. With Shrink, they compress toward their minimums
 ///    and Fixed columns stay put.
+/// 9. The outer frame must stay visible on all four sides with stripes on, at
+///    every scroll position, and over the scrollbars.
+/// 10. Turn on "Conditional" -- Cost cells go red where the quarter lost money,
+///     Revenue goes green where it made money, and the colours must survive
+///     scrolling, selection and column selection.
+/// 11. "ID" and "Actions" are ungrouped, so their header cells run the full
+///     height of the header. Their column rules must run the full height too,
+///     and clicking the blank band at the top of either must select the column.
+/// 12. Drag a column edge. The indicator must appear and track the pointer for
+///     the whole drag, the edge must stay glued to the cursor, and both must
+///     stop the instant the button comes up. Nothing may happen only on release.
+/// 13. Click a sort arrow three times: ascending, descending, unsorted. Click a
+///     different column's arrow -- it must restart at ascending. Clicking the
+///     header anywhere *other* than the arrow must still select the column.
+/// 14. Shift-select a block of rows. The outline must box the whole block once,
+///     not each row separately.
 const CHECKS: () = ();
 
 fn main() -> iced::Result {
@@ -102,6 +120,8 @@ enum Message {
     OverflowChanged(OverflowChoice),
     ToggleGroups(bool),
     ToggleStripes(bool),
+    ToggleConditional(bool),
+    SortChanged(Option<Sort>),
 }
 
 struct Demo {
@@ -110,6 +130,8 @@ struct Demo {
     overflow: OverflowChoice,
     groups: bool,
     stripes: bool,
+    conditional: bool,
+    sort: Option<Sort>,
     selected: BTreeSet<usize>,
     selected_columns: BTreeSet<usize>,
     status: String,
@@ -123,6 +145,8 @@ impl Default for Demo {
             overflow: OverflowChoice::Scroll,
             groups: true,
             stripes: true,
+            conditional: true,
+            sort: None,
             selected: BTreeSet::new(),
             selected_columns: BTreeSet::new(),
             status: String::from("no row clicked yet"),
@@ -162,6 +186,37 @@ impl Demo {
                 q4_cost: ((i * 3499) % 40_000 + 5_000) as u32,
             })
             .collect();
+
+        self.resort();
+    }
+
+    /// The table reports what the sort should become; putting the rows in that
+    /// order is the application's job. `sort.column` is the leaf column index,
+    /// which is the same index the `rows` view function matches on -- so the
+    /// two `match`es line up one to one.
+    fn resort(&mut self) {
+        let Some(sort) = self.sort else {
+            self.records.sort_by_key(|record| record.id);
+            return;
+        };
+
+        self.records.sort_by(|a, b| {
+            let ordering = match sort.column {
+                0 => a.id.cmp(&b.id),
+                1 => a.first.cmp(b.first),
+                2 => a.last.cmp(b.last),
+                3 => a.q3_revenue.cmp(&b.q3_revenue),
+                4 => a.q3_cost.cmp(&b.q3_cost),
+                5 => a.q4_revenue.cmp(&b.q4_revenue),
+                6 => a.q4_cost.cmp(&b.q4_cost),
+                _ => std::cmp::Ordering::Equal,
+            };
+
+            match sort.direction {
+                Direction::Ascending => ordering,
+                Direction::Descending => ordering.reverse(),
+            }
+        });
     }
 
     fn update(&mut self, message: Message) -> Task<Message> {
@@ -193,6 +248,19 @@ impl Demo {
             Message::OverflowChanged(overflow) => self.overflow = overflow,
             Message::ToggleGroups(groups) => self.groups = groups,
             Message::ToggleStripes(stripes) => self.stripes = stripes,
+            Message::ToggleConditional(conditional) => self.conditional = conditional,
+            Message::SortChanged(sort) => {
+                self.sort = sort;
+                self.status = match sort {
+                    Some(sort) => format!("sorted by column {} ({:?})", sort.column, sort.direction),
+                    None => "unsorted".to_string(),
+                };
+                // Row indices are positional, so reordering the data re-points
+                // every selected index at a different record. A real app would
+                // key its selection by id; the demo just drops it.
+                self.selected.clear();
+                self.resort();
+            }
         }
 
         Task::none()
@@ -218,6 +286,9 @@ impl Demo {
             checkbox(self.stripes)
                 .label("Stripes")
                 .on_toggle(Message::ToggleStripes),
+            checkbox(self.conditional)
+                .label("Conditional")
+                .on_toggle(Message::ToggleConditional),
         ]
         .spacing(12)
         .align_y(alignment::Vertical::Center);
@@ -228,10 +299,14 @@ impl Demo {
             vec![
                 leaf(text("ID"))
                     .fixed(70.0)
-                    .align(alignment::Horizontal::Right),
+                    .align(alignment::Horizontal::Right)
+                    .sortable(),
                 group(
                     text("Contact"),
-                    vec![leaf(text("First")).fill(1), leaf(text("Last")).fill(2)],
+                    vec![
+                        leaf(text("First")).fill(1).sortable(),
+                        leaf(text("Last")).fill(2).sortable(),
+                    ],
                 ),
                 // This label is wider than the four numeric columns beneath it,
                 // which is what exercises apply_span_constraints.
@@ -241,15 +316,23 @@ impl Demo {
                         group(
                             text("Q3"),
                             vec![
-                                leaf(text("Revenue")).align(alignment::Horizontal::Right),
-                                leaf(text("Cost")).align(alignment::Horizontal::Right),
+                                leaf(text("Revenue"))
+                                    .align(alignment::Horizontal::Right)
+                                    .sortable(),
+                                leaf(text("Cost"))
+                                    .align(alignment::Horizontal::Right)
+                                    .sortable(),
                             ],
                         ),
                         group(
                             text("Q4"),
                             vec![
-                                leaf(text("Revenue")).align(alignment::Horizontal::Right),
-                                leaf(text("Cost")).align(alignment::Horizontal::Right),
+                                leaf(text("Revenue"))
+                                    .align(alignment::Horizontal::Right)
+                                    .sortable(),
+                                leaf(text("Cost"))
+                                    .align(alignment::Horizontal::Right)
+                                    .sortable(),
                             ],
                         ),
                     ],
@@ -260,18 +343,29 @@ impl Demo {
             vec![
                 leaf(text("ID"))
                     .fixed(70.0)
-                    .align(alignment::Horizontal::Right),
-                leaf(text("First")).fill(1),
-                leaf(text("Last")).fill(2),
-                leaf(text("Q3 Revenue")).align(alignment::Horizontal::Right),
-                leaf(text("Q3 Cost")).align(alignment::Horizontal::Right),
-                leaf(text("Q4 Revenue")).align(alignment::Horizontal::Right),
-                leaf(text("Q4 Cost")).align(alignment::Horizontal::Right),
+                    .align(alignment::Horizontal::Right)
+                    .sortable(),
+                leaf(text("First")).fill(1).sortable(),
+                leaf(text("Last")).fill(2).sortable(),
+                leaf(text("Q3 Revenue"))
+                    .align(alignment::Horizontal::Right)
+                    .sortable(),
+                leaf(text("Q3 Cost"))
+                    .align(alignment::Horizontal::Right)
+                    .sortable(),
+                leaf(text("Q4 Revenue"))
+                    .align(alignment::Horizontal::Right)
+                    .sortable(),
+                leaf(text("Q4 Cost"))
+                    .align(alignment::Horizontal::Right)
+                    .sortable(),
                 leaf(text("Actions")).fixed(110.0),
             ]
         };
 
         let stripes = self.stripes;
+        let conditional = self.conditional;
+        let records = &self.records;
 
         let table = DataTable::new(headers)
             .rows(&self.records, |record, column| match column {
@@ -299,6 +393,7 @@ impl Demo {
                 &self.selected_columns,
                 Message::ColumnsChanged,
             )
+            .sorting(self.sort, Message::SortChanged)
             .overflow(match self.overflow {
                 OverflowChoice::Scroll => Overflow::Scroll,
                 OverflowChoice::Shrink => Overflow::Shrink,
@@ -315,6 +410,46 @@ impl Demo {
                 }
 
                 style
+            })
+            // The answer to "how do I do conditional styling per column?".
+            // Note that the condition is not really about the column -- it is
+            // about the *value*, which the widget cannot see. So the hook hands
+            // back the coordinates and we look the record up ourselves, exactly
+            // as the `rows` view function above does.
+            .cell_style(move |theme, cell| {
+                if !conditional {
+                    return CellStyle::default();
+                }
+
+                let Some(record) = records.get(cell.row) else {
+                    return CellStyle::default();
+                };
+
+                let (revenue, cost) = match cell.column {
+                    3 | 4 => (record.q3_revenue, record.q3_cost),
+                    5 | 6 => (record.q4_revenue, record.q4_cost),
+                    _ => return CellStyle::default(),
+                };
+
+                let palette = theme.palette();
+                let profitable = revenue > cost * 2;
+
+                match cell.column {
+                    // Revenue: colour alone, so the number still reads as a
+                    // number rather than as a badge.
+                    3 | 5 if profitable => CellStyle::default().color(palette.success.base.color),
+                    // Cost: colour plus a wash, to show a cell background
+                    // composing with the stripes and the selection highlight.
+                    // It is translucent on purpose -- an opaque fill here would
+                    // hide the row selection underneath it.
+                    4 | 6 if !profitable => CellStyle::default()
+                        .color(palette.danger.base.color)
+                        .background(Color {
+                            a: 0.15,
+                            ..palette.danger.base.color
+                        }),
+                    _ => CellStyle::default(),
+                }
             });
 
         column![

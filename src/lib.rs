@@ -55,6 +55,7 @@ pub mod header;
 pub mod scroll;
 pub mod selection;
 pub mod sizing;
+pub mod sort;
 pub mod style;
 pub mod table;
 
@@ -62,7 +63,8 @@ pub use header::{group, leaf, ColumnSpec, HeaderNode};
 pub use scroll::Policy;
 pub use selection::Mode as SelectionMode;
 pub use sizing::{Overflow, Sizing};
-pub use style::{Catalog, Style};
+pub use sort::{Direction, Sort};
+pub use style::{Catalog, Cell, CellStyle, Style};
 pub use table::DataTable;
 
 /// Convenience constructor mirroring iced's `fn`-style widget helpers.
