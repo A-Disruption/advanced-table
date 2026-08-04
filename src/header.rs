@@ -129,9 +129,15 @@ pub struct Flattened<'a, Message, Theme, Renderer> {
 /// the whole thing tractable: after this point nothing downstream knows or
 /// cares that groups exist.
 ///
-/// A leaf shallower than the deepest branch is given a `row_span` reaching the
-/// bottom row, so every leaf header bottoms out against the body. That bottom
-/// alignment is most of what makes a stacked header read as deliberate.
+/// Every node is placed at `total_rows - subtree_depth`, which pushes each
+/// branch **down** so it sits directly on top of its children and leaves the
+/// blank space at the top. Placing by distance-from-root instead strands a
+/// group at the top with an empty band between it and the columns it labels,
+/// which reads as though the group belongs to some other level entirely.
+///
+/// A consequence is that every cell occupies exactly one row: children always
+/// fill the row immediately below their parent, so nothing needs to span
+/// downward to reach the body.
 pub fn flatten<'a, Message, Theme, Renderer>(
     nodes: Vec<HeaderNode<'a, Message, Theme, Renderer>>,
 ) -> Flattened<'a, Message, Theme, Renderer> {
@@ -145,7 +151,7 @@ pub fn flatten<'a, Message, Theme, Renderer>(
     };
 
     for node in nodes {
-        walk(node, 0, depth, &mut out);
+        walk(node, depth, &mut out);
     }
 
     out
@@ -160,11 +166,14 @@ fn max_depth<Message, Theme, Renderer>(node: &HeaderNode<'_, Message, Theme, Ren
 
 fn walk<'a, Message, Theme, Renderer>(
     node: HeaderNode<'a, Message, Theme, Renderer>,
-    row: usize,
     total_rows: usize,
     out: &mut Flattened<'a, Message, Theme, Renderer>,
 ) -> (usize, usize) {
     let element = out.elements.len();
+    // Bottom-anchored: a subtree three deep starts at the top, one deep sits
+    // on the last row.
+    let row = total_rows.saturating_sub(max_depth(&node));
+
     out.elements.push(node.content);
 
     match node.kind {
@@ -176,7 +185,7 @@ fn walk<'a, Message, Theme, Renderer>(
                 start: index,
                 end: index,
                 row,
-                row_span: total_rows - row,
+                row_span: 1,
             });
             (index, index)
         }
@@ -197,7 +206,11 @@ fn walk<'a, Message, Theme, Renderer>(
             let mut end = 0;
 
             for child in children {
-                let (s, e) = walk(child, row + 1, total_rows, out);
+                // `total_rows` stays constant. The placement formula already
+                // accounts for depth via the subtree height, so decrementing
+                // here counts it twice and collapses every deeper level onto
+                // row zero, stacking group labels on top of their own leaves.
+                let (s, e) = walk(child, total_rows, out);
                 start = start.min(s);
                 end = end.max(e);
             }
@@ -254,10 +267,98 @@ mod tests {
         assert_eq!((group_cell.start, group_cell.end), (1, 2));
         assert_eq!(group_cell.row, 0);
 
-        // The ungrouped leaf drops to the bottom row alongside Email/Phone.
+        // The group sits directly on top of its children, not at the root.
+        assert_eq!(group_cell.row, 0);
+
+        // The ungrouped leaf drops to the bottom row alongside Email/Phone,
+        // leaving the blank band above it rather than below.
         let name = f.cells.iter().find(|c| c.start == 0 && c.is_leaf()).unwrap();
-        assert_eq!(name.row, 0);
-        assert_eq!(name.row_span, 2);
+        assert_eq!(name.row, 1);
+        assert_eq!(name.row_span, 1);
+    }
+
+    #[test]
+    fn no_two_cells_in_a_row_ever_overlap() {
+        // The failure this guards against is subtle to read but obvious on
+        // screen: labels from different levels stacked on the same band,
+        // drawn over each other. It only shows up with three levels and a
+        // shallow sibling, so the simpler tests above all pass without it.
+        let f = flatten(vec![
+            text_leaf("ID"),
+            group(
+                iced::widget::text("Contact"),
+                vec![text_leaf("First"), text_leaf("Last")],
+            ),
+            group(
+                iced::widget::text("Financials"),
+                vec![
+                    group(
+                        iced::widget::text("Q3"),
+                        vec![text_leaf("Rev"), text_leaf("Cost")],
+                    ),
+                    group(
+                        iced::widget::text("Q4"),
+                        vec![text_leaf("Rev"), text_leaf("Cost")],
+                    ),
+                ],
+            ),
+            text_leaf("Actions"),
+        ]);
+
+        assert_eq!(f.rows, 3);
+        assert_eq!(f.columns.len(), 8);
+
+        for row in 0..f.rows {
+            let mut band: Vec<_> = f.cells.iter().filter(|c| c.row == row).collect();
+            band.sort_by_key(|c| c.start);
+
+            for pair in band.windows(2) {
+                assert!(
+                    pair[0].end < pair[1].start,
+                    "row {row}: cells {:?} and {:?} overlap",
+                    (pair[0].start, pair[0].end),
+                    (pair[1].start, pair[1].end),
+                );
+            }
+        }
+
+        // Exactly one cell on the top band, and every leaf on the last.
+        assert_eq!(f.cells.iter().filter(|c| c.row == 0).count(), 1);
+        assert!(f.cells.iter().filter(|c| c.is_leaf()).all(|c| c.row == 2));
+    }
+
+    #[test]
+    fn a_shallow_group_is_pushed_down_to_meet_its_children() {
+        // "Financials" is 3 deep, "Contact" only 2. Contact must sit on row 1,
+        // directly above its leaves -- not on row 0 with a gap beneath it.
+        let f = flatten(vec![
+            text_leaf("ID"),
+            group(
+                iced::widget::text("Contact"),
+                vec![text_leaf("First"), text_leaf("Last")],
+            ),
+            group(
+                iced::widget::text("Financials"),
+                vec![group(
+                    iced::widget::text("Q3"),
+                    vec![text_leaf("Rev"), text_leaf("Cost")],
+                )],
+            ),
+        ]);
+
+        assert_eq!(f.rows, 3);
+
+        let contact = f.cells.iter().find(|c| c.start == 1 && c.end == 2).unwrap();
+        assert_eq!(contact.row, 1, "shallow group must sit above its children");
+
+        let financials = f.cells.iter().find(|c| c.start == 3 && c.end == 4).unwrap();
+        assert_eq!(financials.row, 0);
+
+        // Every leaf lands on the last row.
+        for cell in f.cells.iter().filter(|c| c.is_leaf()) {
+            assert_eq!(cell.row, 2, "leaves bottom out against the body");
+            assert_eq!(cell.row_span, 1);
+        }
     }
 
     #[test]
@@ -282,7 +383,7 @@ mod tests {
         let q3 = f.cells.iter().find(|c| c.row == 1 && c.start == 0).unwrap();
         assert_eq!((q3.start, q3.end), (0, 1));
 
-        // Q4 has only one leaf, so its leaf sits on the bottom row.
+        // Q4 has only one leaf, and every leaf sits on the bottom row.
         let q4_leaf = f.cells.iter().find(|c| c.start == 2 && c.is_leaf()).unwrap();
         assert_eq!(q4_leaf.row, 2);
         assert_eq!(q4_leaf.row_span, 1);

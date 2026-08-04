@@ -98,6 +98,34 @@ pub fn visible_rows(offset_y: f32, viewport_height: f32, row_height: f32, count:
     (first.min(count), last)
 }
 
+/// Which row sits under a point, in screen coordinates.
+///
+/// `body` is the region below the header. The point is converted into content
+/// space by subtracting the region origin and adding the scroll offset -- the
+/// exact inverse of the translation `draw` applies, which is why the two stay
+/// consistent when scrolled.
+pub fn row_at(
+    point: Point,
+    body: Rectangle,
+    offset_y: f32,
+    row_height: f32,
+    count: usize,
+) -> Option<usize> {
+    if row_height <= 0.0 || count == 0 || !body.contains(point) {
+        return None;
+    }
+
+    let content_y = point.y - body.y + offset_y;
+
+    if content_y < 0.0 {
+        return None;
+    }
+
+    let row = (content_y / row_height).floor() as usize;
+
+    (row < count).then_some(row)
+}
+
 /// Build scrollbar geometry for the body region.
 ///
 /// `body` is the region *below* the header -- the header does not scroll
@@ -226,6 +254,36 @@ mod tests {
         assert_eq!(visible_rows(0.0, 300.0, 30.0, 1000), (0, 11));
         assert_eq!(visible_rows(305.0, 300.0, 30.0, 1000), (10, 21));
         assert_eq!(visible_rows(29_999.0, 300.0, 30.0, 1000), (999, 1000));
+    }
+
+    #[test]
+    fn row_at_matches_the_drawn_position_while_scrolled() {
+        let body = Rectangle { x: 0.0, y: 100.0, width: 400.0, height: 300.0 };
+
+        // Unscrolled: first row starts at the top of the body.
+        assert_eq!(row_at(Point::new(10.0, 105.0), body, 0.0, 30.0, 1000), Some(0));
+        assert_eq!(row_at(Point::new(10.0, 135.0), body, 0.0, 30.0, 1000), Some(1));
+
+        // Scrolled by exactly ten rows: the row under the top edge is row 10.
+        assert_eq!(row_at(Point::new(10.0, 105.0), body, 300.0, 30.0, 1000), Some(10));
+
+        // Consistent with what draw() would have painted there.
+        let (first, _) = visible_rows(300.0, body.height, 30.0, 1000);
+        assert_eq!(first, 10);
+    }
+
+    #[test]
+    fn row_at_rejects_points_outside_the_body_or_past_the_end() {
+        let body = Rectangle { x: 0.0, y: 100.0, width: 400.0, height: 300.0 };
+
+        // In the header, above the body.
+        assert_eq!(row_at(Point::new(10.0, 50.0), body, 0.0, 30.0, 1000), None);
+        // Below the body.
+        assert_eq!(row_at(Point::new(10.0, 500.0), body, 0.0, 30.0, 1000), None);
+        // Past the last row: only 5 rows exist.
+        assert_eq!(row_at(Point::new(10.0, 390.0), body, 0.0, 30.0, 5), None);
+        // Degenerate.
+        assert_eq!(row_at(Point::new(10.0, 105.0), body, 0.0, 0.0, 5), None);
     }
 
     #[test]

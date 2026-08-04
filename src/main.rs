@@ -3,7 +3,9 @@
 //! Each control here targets something that is hard to verify by reading the
 //! code. Notes on what to actually look for are in `CHECKS` below.
 
-use advanced_table::{group, leaf, DataTable, Overflow, Policy, Sizing};
+use advanced_table::{group, leaf, DataTable, Overflow, Policy, SelectionMode, Sizing};
+
+use std::collections::BTreeSet;
 
 use iced::widget::{button, checkbox, column, container, pick_list, row, text};
 use iced::{alignment, Element, Fill, Length, Task};
@@ -94,6 +96,8 @@ impl std::fmt::Display for OverflowChoice {
 #[derive(Debug, Clone)]
 enum Message {
     Open(u32),
+    SelectionChanged(BTreeSet<usize>),
+    ColumnsChanged(BTreeSet<usize>),
     RowsChanged(RowCount),
     OverflowChanged(OverflowChoice),
     ToggleGroups(bool),
@@ -106,6 +110,8 @@ struct Demo {
     overflow: OverflowChoice,
     groups: bool,
     stripes: bool,
+    selected: BTreeSet<usize>,
+    selected_columns: BTreeSet<usize>,
     status: String,
 }
 
@@ -117,6 +123,8 @@ impl Default for Demo {
             overflow: OverflowChoice::Scroll,
             groups: true,
             stripes: true,
+            selected: BTreeSet::new(),
+            selected_columns: BTreeSet::new(),
             status: String::from("no row clicked yet"),
         };
 
@@ -161,8 +169,25 @@ impl Demo {
             Message::Open(id) => {
                 self.status = format!("clicked row id {id}");
             }
+            Message::SelectionChanged(selection) => {
+                self.status = match selection.len() {
+                    0 => "nothing selected".to_string(),
+                    1 => format!("selected row {}", selection.iter().next().unwrap()),
+                    n => format!(
+                        "selected {n} rows ({}..={})",
+                        selection.iter().next().unwrap(),
+                        selection.iter().next_back().unwrap()
+                    ),
+                };
+                self.selected = selection;
+            }
+            Message::ColumnsChanged(columns) => {
+                self.status = format!("{} column(s) selected", columns.len());
+                self.selected_columns = columns;
+            }
             Message::RowsChanged(rows) => {
                 self.rows = rows;
+                self.selected.clear();
                 self.regenerate();
             }
             Message::OverflowChanged(overflow) => self.overflow = overflow,
@@ -264,6 +289,16 @@ impl Demo {
                     .on_press(Message::Open(record.id))
                     .into(),
             })
+            .selection(
+                SelectionMode::Multiple,
+                &self.selected,
+                Message::SelectionChanged,
+            )
+            .column_selection(
+                SelectionMode::Multiple,
+                &self.selected_columns,
+                Message::ColumnsChanged,
+            )
             .overflow(match self.overflow {
                 OverflowChoice::Scroll => Overflow::Scroll,
                 OverflowChoice::Shrink => Overflow::Shrink,

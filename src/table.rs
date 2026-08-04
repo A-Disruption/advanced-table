@@ -39,6 +39,7 @@ use iced::advanced::layout::{self, Layout};
 use iced::advanced::renderer;
 use iced::advanced::widget::{tree, Operation, Tree};
 use iced::advanced::{Shell, Widget};
+use std::collections::BTreeSet;
 use iced::{
     alignment, keyboard, mouse, touch, Element, Event, Length, Padding, Point, Rectangle, Size,
     Vector,
@@ -46,6 +47,7 @@ use iced::{
 
 use crate::header::{self, ColumnSpec, HeaderCell, HeaderNode};
 use crate::scroll::{self, Policy};
+use crate::selection::{self, Mode};
 use crate::sizing::{self, Overflow, Sizing, SpanRequest};
 use crate::style::{Catalog, Style};
 
@@ -77,6 +79,18 @@ where
     scrollbar_width: f32,
     vertical: Policy,
     horizontal: Policy,
+
+    mode: Mode,
+    selected: BTreeSet<usize>,
+    on_select: Option<Box<dyn Fn(BTreeSet<usize>) -> Message + 'a>>,
+
+    column_mode: Mode,
+    selected_columns: BTreeSet<usize>,
+    on_select_column: Option<Box<dyn Fn(BTreeSet<usize>) -> Message + 'a>>,
+
+    /// Blank strip at the left and right edges, inside the widget but outside
+    /// every column.
+    gutter: f32,
 
     resizable: bool,
     /// Half-width of the grab zone either side of a column edge.
@@ -118,6 +132,12 @@ struct State {
 
     /// Tracked so Shift+wheel can be turned into horizontal scrolling.
     modifiers: keyboard::Modifiers,
+
+    /// Row a Shift-range extends from. Ephemeral interaction state, which is
+    /// why it lives here while the selection set itself does not.
+    anchor: Option<usize>,
+    column_anchor: Option<usize>,
+    hovered: Option<usize>,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -151,6 +171,13 @@ where
             scrollbar_width: 10.0,
             vertical: Policy::Auto,
             horizontal: Policy::Auto,
+            mode: Mode::None,
+            selected: BTreeSet::new(),
+            on_select: None,
+            column_mode: Mode::None,
+            selected_columns: BTreeSet::new(),
+            on_select_column: None,
+            gutter: 6.0,
             resizable: true,
             resize_tolerance: 4.0,
             min_column_width: 32.0,
@@ -249,6 +276,52 @@ where
         self
     }
 
+    /// Enable row selection and report changes.
+    ///
+    /// The widget does not keep the selection -- it renders the set you pass
+    /// and hands back what the set should become. Store it in your own state
+    /// and feed it back in on the next `view`.
+    pub fn selection(
+        mut self,
+        mode: Mode,
+        selected: &BTreeSet<usize>,
+        on_select: impl Fn(BTreeSet<usize>) -> Message + 'a,
+    ) -> Self {
+        self.mode = mode;
+        self.selected = selected.clone();
+        self.on_select = Some(Box::new(on_select));
+        self
+    }
+
+    /// Enable column selection by clicking header cells.
+    ///
+    /// Clicking a group header selects every leaf column beneath it. Same
+    /// ownership rule as row selection: you hold the set, the widget reports
+    /// what it should become.
+    pub fn column_selection(
+        mut self,
+        mode: Mode,
+        selected: &BTreeSet<usize>,
+        on_select: impl Fn(BTreeSet<usize>) -> Message + 'a,
+    ) -> Self {
+        self.column_mode = mode;
+        self.selected_columns = selected.clone();
+        self.on_select_column = Some(Box::new(on_select));
+        self
+    }
+
+    /// Blank strip at each side of the table, inside the widget but belonging
+    /// to no column.
+    ///
+    /// It exists so there is somewhere to click that unambiguously means "this
+    /// row" rather than "this cell" -- without it, every pixel of a row is
+    /// owned by some column and row selection has to fight cell interaction
+    /// for the same clicks.
+    pub fn gutter(mut self, gutter: f32) -> Self {
+        self.gutter = gutter;
+        self
+    }
+
     /// Allow dragging leaf column edges in the header. On by default.
     pub fn resizable(mut self, resizable: bool) -> Self {
         self.resizable = resizable;
@@ -333,6 +406,42 @@ fn resize_edge_at(
         let edge = bounds.x + state.offsets[i] + state.widths[i] + spacing / 2.0 - state.offset.x;
         (point.x - edge).abs() <= tolerance
     })
+}
+
+/// Which header cell sits under a point, in screen coordinates.
+///
+/// Searched deepest-row-first so a leaf wins over the group stacked above it;
+/// their rectangles do not overlap, but ordering the search this way keeps it
+/// correct if a future change lets them.
+fn header_cell_at(
+    point: Point,
+    bounds: Rectangle,
+    header: Rectangle,
+    cells: &[HeaderCell],
+    state: &State,
+    spacing: f32,
+) -> Option<usize> {
+    if !header.contains(point) || state.widths.is_empty() {
+        return None;
+    }
+
+    let mut best: Option<(usize, usize)> = None;
+
+    for (i, cell) in cells.iter().enumerate() {
+        let left = bounds.x + state.offsets[cell.start] - state.offset.x;
+        let right =
+            bounds.x + state.offsets[cell.end] + state.widths[cell.end] - state.offset.x + spacing;
+        let top = bounds.y + state.header_row_height * cell.row as f32;
+        let bottom = top + state.header_row_height * cell.row_span as f32;
+
+        if point.x >= left && point.x < right && point.y >= top && point.y < bottom {
+            if best.is_none_or(|(_, row)| cell.row >= row) {
+                best = Some((i, cell.row));
+            }
+        }
+    }
+
+    best.map(|(i, _)| i)
 }
 
 impl<'a, Message: 'a, Theme, Renderer> Widget<Message, Theme, Renderer>
@@ -452,13 +561,20 @@ where
         // columns fill the visible area and only overflow (and therefore
         // scroll) when their intrinsic content genuinely exceeds it.
         // ------------------------------------------------------------------
-        let available = limits.max().width;
+        // The gutter is carved out of the available width first, then folded
+        // into every column offset. Doing it here means nothing downstream --
+        // hit tests, dividers, column bands -- needs to know it exists.
+        let available = (limits.max().width - self.gutter * 2.0).max(0.0);
         let widths =
             sizing::resolve_widths(&sizing, &intrinsic, available, self.spacing, self.overflow);
-        let offsets = sizing::offsets(&widths, self.spacing);
+        let offsets: Vec<f32> = sizing::offsets(&widths, self.spacing)
+            .into_iter()
+            .map(|x| x + self.gutter)
+            .collect();
 
-        let content_width =
-            widths.iter().sum::<f32>() + self.spacing * (columns.saturating_sub(1)) as f32;
+        let content_width = widths.iter().sum::<f32>()
+            + self.spacing * (columns.saturating_sub(1)) as f32
+            + self.gutter * 2.0;
         let header_height = header_row_height * self.header_rows as f32;
         let body_height = row_height * self.row_count as f32;
 
@@ -477,6 +593,10 @@ where
             let height = header_row_height * cell.row_span as f32;
             let inner = Size::new((width - h_pad).max(0.0), (height - v_pad).max(0.0));
 
+            // `align` ADDS an offset; `move_to` SETS the position. Doing them
+            // the other way round silently discards the alignment, which is
+            // why everything rendered top-left regardless of what was asked
+            // for. Position first, then align within the cell.
             nodes[cell.element] = self.elements[cell.element]
                 .as_widget_mut()
                 .layout(
@@ -484,15 +604,31 @@ where
                     renderer,
                     &layout::Limits::new(Size::ZERO, inner),
                 )
-                .align(
-                    alignment::Alignment::Center,
-                    alignment::Alignment::Center,
-                    inner,
-                )
                 .move_to(Point::new(
                     offsets[cell.start] + self.padding.left,
                     header_row_height * cell.row as f32 + self.padding.top,
-                ));
+                ))
+                .align(
+                    if cell.is_leaf() {
+                        // A leaf header labels one column, so it should sit
+                        // over that column the way the data does.
+                        self.columns[cell.start].align.into()
+                    } else {
+                        // A group label belongs to its whole span, so centre
+                        // it across the span rather than over its first leaf.
+                        alignment::Alignment::Center
+                    },
+                    if cell.is_leaf() {
+                        // Leaf headers drop to the bottom of their span, next
+                        // to the rows they describe. A leaf floating at the
+                        // top of a three-row stack reads as belonging to the
+                        // group level rather than to the column.
+                        alignment::Alignment::End
+                    } else {
+                        alignment::Alignment::Center
+                    },
+                    inner,
+                );
         }
 
         for row in 0..self.row_count {
@@ -512,15 +648,15 @@ where
                         renderer,
                         &layout::Limits::new(Size::ZERO, inner),
                     )
+                    .move_to(Point::new(
+                        offsets[column] + self.padding.left,
+                        y + self.padding.top,
+                    ))
                     .align(
                         self.columns[column].align.into(),
                         alignment::Alignment::Center,
                         inner,
-                    )
-                    .move_to(Point::new(
-                        offsets[column] + self.padding.left,
-                        y + self.padding.top,
-                    ));
+                    );
             }
         }
 
@@ -605,18 +741,72 @@ where
 
                 // Stripes span the full content width, not the viewport, so
                 // they stay continuous while scrolled sideways.
+                let full_width = state.content.width.max(bounds.width);
+
+                let row_rect = |row: usize| Rectangle {
+                    x: bounds.x,
+                    y: bounds.y + state.header_height + state.row_height * row as f32,
+                    width: full_width,
+                    height: state.row_height,
+                };
+
                 if let Some(background) = appearance.alternate_row_background {
                     for row in (first..last).filter(|r| r % 2 == 1) {
                         renderer.fill_quad(
                             renderer::Quad {
-                                bounds: Rectangle {
-                                    x: bounds.x,
-                                    y: bounds.y
-                                        + state.header_height
-                                        + state.row_height * row as f32,
-                                    width: state.content.width.max(bounds.width),
-                                    height: state.row_height,
+                                bounds: row_rect(row),
+                                ..Default::default()
+                            },
+                            background,
+                        );
+                    }
+                }
+
+                // Column bands sit above the stripes but below the row
+                // highlights, so a selected row still reads as selected where
+                // the two cross.
+                if let Some(background) = appearance.selected_column_background {
+                    for column in &self.selected_columns {
+                        if *column < state.widths.len() {
+                            renderer.fill_quad(
+                                renderer::Quad {
+                                    bounds: Rectangle {
+                                        x: bounds.x + state.offsets[*column],
+                                        y: body.y + offset.y,
+                                        width: state.widths[*column],
+                                        height: body.height,
+                                    },
+                                    ..Default::default()
                                 },
+                                background,
+                            );
+                        }
+                    }
+                }
+
+                // Hover first, selection over it: a selected row that is also
+                // hovered should still read as selected.
+                if let (Some(background), Some(row)) =
+                    (appearance.hovered_row_background, state.hovered)
+                {
+                    if row >= first && row < last && !self.selected.contains(&row) {
+                        renderer.fill_quad(
+                            renderer::Quad {
+                                bounds: row_rect(row),
+                                ..Default::default()
+                            },
+                            background,
+                        );
+                    }
+                }
+
+                if let Some(background) = appearance.selected_row_background {
+                    // Only the visible slice -- `selected` may hold thousands
+                    // of rows after a Shift-range over a large table.
+                    for row in self.selected.range(first..last) {
+                        renderer.fill_quad(
+                            renderer::Quad {
+                                bounds: row_rect(*row),
                                 ..Default::default()
                             },
                             background,
@@ -1087,7 +1277,153 @@ where
             );
         }
 
-        // --- 4. wheel, only if nothing downstream claimed the event ---
+        // --- 4. row hover and selection ---
+        //
+        // Deliberately after child forwarding: a button inside a cell captures
+        // its own press, so clicking "Open" does not also select the row.
+        if shell.is_event_captured() {
+            return;
+        }
+
+        if self.mode != Mode::None {
+            match event {
+                Event::Mouse(mouse::Event::CursorMoved { .. }) => {
+                    let hovered = cursor
+                        .position()
+                        .and_then(|point| {
+                            scroll::row_at(point, body, offset.y, row_height, self.row_count)
+                        });
+
+                    let state = tree.state.downcast_mut::<State>();
+
+                    if state.hovered != hovered {
+                        state.hovered = hovered;
+                        shell.request_redraw();
+                    }
+                }
+                Event::Mouse(mouse::Event::ButtonPressed(mouse::Button::Left)) => {
+                    if let Some(row) = cursor.position().and_then(|point| {
+                        scroll::row_at(point, body, offset.y, row_height, self.row_count)
+                    }) {
+                        let state = tree.state.downcast_mut::<State>();
+                        let modifiers = state.modifiers;
+
+                        if let Some(outcome) = selection::apply(
+                            self.mode,
+                            &self.selected,
+                            state.anchor,
+                            row,
+                            modifiers.command(),
+                            modifiers.shift(),
+                        ) {
+                            state.anchor = outcome.anchor;
+
+                            if let Some(on_select) = &self.on_select {
+                                shell.publish(on_select(outcome.selection));
+                            }
+
+                            // Rows and columns are alternative readings of the
+                            // same grid, so selecting one clears the other.
+                            // The widget cannot mutate a set it does not own,
+                            // so it publishes a second message instead --
+                            // guarded, to avoid emitting a no-op every click.
+                            if !self.selected_columns.is_empty() {
+                                if let Some(on_columns) = &self.on_select_column {
+                                    shell.publish(on_columns(BTreeSet::new()));
+                                }
+                            }
+
+                            shell.capture_event();
+                            shell.request_redraw();
+                            return;
+                        }
+                    }
+                }
+                _ => {}
+            }
+        }
+
+        // --- 5. column selection from header clicks ---
+        if self.column_mode != Mode::None {
+            if let Event::Mouse(mouse::Event::ButtonPressed(mouse::Button::Left)) = event {
+                let header_region = Rectangle {
+                    height: header_height,
+                    ..bounds
+                };
+
+                let hit = cursor.position().and_then(|point| {
+                    let state = tree.state.downcast_ref::<State>();
+                    header_cell_at(
+                        point,
+                        bounds,
+                        header_region,
+                        &self.header_cells,
+                        state,
+                        self.spacing,
+                    )
+                });
+
+                if let Some(i) = hit {
+                    let cell = self.header_cells[i];
+                    let state = tree.state.downcast_mut::<State>();
+                    let modifiers = state.modifiers;
+                    let toggle = modifiers.command();
+
+                    let outcome = if cell.is_leaf() {
+                        selection::apply(
+                            self.column_mode,
+                            &self.selected_columns,
+                            state.column_anchor,
+                            cell.start,
+                            toggle,
+                            modifiers.shift(),
+                        )
+                    } else if self.column_mode == Mode::Single {
+                        selection::apply(
+                            self.column_mode,
+                            &self.selected_columns,
+                            state.column_anchor,
+                            cell.start,
+                            false,
+                            false,
+                        )
+                    } else {
+                        // A group covers its whole span. That is exactly a
+                        // range extension from its first leaf to its last, so
+                        // it reuses the same resolution logic rather than
+                        // needing a second code path.
+                        selection::apply(
+                            self.column_mode,
+                            &self.selected_columns,
+                            Some(cell.start),
+                            cell.end,
+                            toggle,
+                            true,
+                        )
+                    };
+
+                    if let Some(outcome) = outcome {
+                        state.column_anchor = outcome.anchor;
+
+                        if let Some(on_select) = &self.on_select_column {
+                            shell.publish(on_select(outcome.selection));
+                        }
+
+                        if !self.selected.is_empty() {
+                            if let Some(on_rows) = &self.on_select {
+                                shell.publish(on_rows(BTreeSet::new()));
+                            }
+                        }
+
+                        shell.capture_event();
+                        shell.request_redraw();
+                        return;
+                    }
+                }
+            }
+        }
+
+        // --- 6. wheel, only if nothing downstream claimed the event ---
         if shell.is_event_captured() {
             return;
         }
