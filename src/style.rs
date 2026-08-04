@@ -79,10 +79,9 @@ pub fn default(theme: &Theme) -> Style {
             ..palette.primary.base.color
         })),
         border: Border {
-            // color: palette.background.strong.color,
-            color: Color::BLACK,
+            color: palette.background.strong.color,
             width: 1.0,
-            radius: 5.0.into(),
+            radius: 0.0.into(),
         },
         column_divider: Some(palette.background.strong.color),
         row_divider: Some(palette.background.strong.color),
