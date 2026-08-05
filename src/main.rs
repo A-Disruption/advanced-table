@@ -70,6 +70,11 @@ use iced::{alignment, Color, Element, Fill, Length, Task};
 /// 20. Select a block and press Ctrl+C, then paste into a spreadsheet. Columns
 ///     land in columns and rows in rows. Ctrl-click a ragged set and the paste
 ///     still arrives as a rectangle with the gaps blank.
+/// 21. Drag a leaf header sideways. A drop indicator appears only after a few
+///     pixels of movement -- a plain click must still just select the column --
+///     and the column lands where the indicator was. With groups on, "First"
+///     may only swap with "Last": it must never land outside Contact. With
+///     sticky on, nothing may cross the frozen seam in either direction.
 const CHECKS: () = ();
 
 /// Leaf columns carrying data. "Actions" holds buttons, so it is not one.
@@ -150,6 +155,7 @@ enum Message {
     ToggleSticky(bool),
     CellsChanged(BTreeSet<CellPosition>),
     Copy,
+    Reordered(usize, usize),
 }
 
 struct Demo {
@@ -161,6 +167,10 @@ struct Demo {
     conditional: bool,
     cells: bool,
     sticky: bool,
+    /// Display position -> logical column. Reordering permutes this; every
+    /// index the widget hands back is a *display* position and is read through
+    /// it before touching the data.
+    order: Vec<usize>,
     sort: Option<Sort>,
     selected_cells: BTreeSet<CellPosition>,
     selected: BTreeSet<usize>,
@@ -179,6 +189,7 @@ impl Default for Demo {
             conditional: true,
             cells: false,
             sticky: true,
+            order: (0..8).collect(),
             sort: None,
             selected_cells: BTreeSet::new(),
             selected: BTreeSet::new(),
@@ -224,6 +235,99 @@ impl Demo {
         self.resort();
     }
 
+    /// One leaf header, by **logical** column. Reordering never changes these;
+    /// it only changes the order they are emitted in.
+    fn column_header(&self, logical: usize) -> advanced_table::HeaderNode<'_, Message, iced::Theme, iced::Renderer> {
+        let right = alignment::Horizontal::Right;
+
+        match logical {
+            0 => leaf(text("ID")).fixed(70.0).align(right).sortable(),
+            1 => leaf(text("First")).fill(1).sortable(),
+            2 => leaf(text("Last")).fill(2).sortable(),
+            3 | 4 | 5 | 6 => {
+                let flat = ["Q3 Revenue", "Q3 Cost", "Q4 Revenue", "Q4 Cost"][logical - 3];
+                let nested = ["Revenue", "Cost", "Revenue", "Cost"][logical - 3];
+
+                leaf(text(if self.groups { nested } else { flat }))
+                    .align(right)
+                    .sortable()
+            }
+            // Buttons, so nothing to sort by.
+            _ => leaf(text("Actions")).fixed(110.0),
+        }
+    }
+
+    /// Rebuild the three-level header from `order`.
+    ///
+    /// Works by scanning for *consecutive* runs sharing a parent. That is sound
+    /// precisely because the widget only ever reports sibling moves, which is
+    /// what keeps a group's columns adjacent -- a group whose leaves were
+    /// scattered would have no rectangle to draw its label in.
+    fn grouped_headers(&self) -> Vec<advanced_table::HeaderNode<'_, Message, iced::Theme, iced::Renderer>> {
+        fn top(logical: usize) -> Option<&'static str> {
+            match logical {
+                1 | 2 => Some("Contact"),
+                3..=6 => Some("Financials (Restated, Unaudited)"),
+                _ => None,
+            }
+        }
+
+        fn quarter(logical: usize) -> &'static str {
+            if logical <= 4 {
+                "Q3"
+            } else {
+                "Q4"
+            }
+        }
+
+        let runs = |slice: &[usize], key: &dyn Fn(usize) -> Option<&'static str>| {
+            let mut out: Vec<(Option<&'static str>, Vec<usize>)> = Vec::new();
+
+            for &logical in slice {
+                let k = key(logical);
+
+                match out.last_mut() {
+                    Some((last, run)) if *last == k && k.is_some() => run.push(logical),
+                    _ => out.push((k, vec![logical])),
+                }
+            }
+
+            out
+        };
+
+        runs(&self.order, &top)
+            .into_iter()
+            .flat_map(|(name, run)| match name {
+                None => run
+                    .into_iter()
+                    .map(|logical| self.column_header(logical))
+                    .collect::<Vec<_>>(),
+                Some(name) if name.starts_with("Financials") => {
+                    let quarters = runs(&run, &|logical| Some(quarter(logical)))
+                        .into_iter()
+                        .map(|(q, leaves)| {
+                            group(
+                                text(q.unwrap_or_default()),
+                                leaves
+                                    .into_iter()
+                                    .map(|logical| self.column_header(logical))
+                                    .collect::<Vec<_>>(),
+                            )
+                        })
+                        .collect::<Vec<_>>();
+
+                    vec![group(text(name), quarters)]
+                }
+                Some(name) => vec![group(
+                    text(name),
+                    run.into_iter()
+                        .map(|logical| self.column_header(logical))
+                        .collect::<Vec<_>>(),
+                )],
+            })
+            .collect()
+    }
+
     /// One cell's value as text. The table never sees these -- it only holds
     /// the `Element` built from them -- so producing them for the clipboard is
     /// necessarily the application's job.
@@ -232,7 +336,7 @@ impl Demo {
             return String::new();
         };
 
-        match column {
+        match self.order.get(column).copied().unwrap_or(column) {
             0 => record.id.to_string(),
             1 => record.first.to_string(),
             2 => record.last.to_string(),
@@ -296,7 +400,7 @@ impl Demo {
         };
 
         self.records.sort_by(|a, b| {
-            let ordering = match sort.column {
+            let ordering = match self.order.get(sort.column).copied().unwrap_or(sort.column) {
                 0 => a.id.cmp(&b.id),
                 1 => a.first.cmp(b.first),
                 2 => a.last.cmp(b.last),
@@ -359,6 +463,30 @@ impl Demo {
             // A real app would open a context menu here, positioned at
             // `click.position`. The status line stands in for it.
             Message::ToggleSticky(sticky) => self.sticky = sticky,
+            Message::Reordered(from, to) => {
+                advanced_table::reorder(&mut self.order, from, to);
+
+                // Column and cell selections are keyed by display position, so
+                // after a permutation they point at different columns than the
+                // user picked. Dropping them is honest; silently re-pointing
+                // them is not.
+                self.selected_columns.clear();
+                self.selected_cells.clear();
+
+                // The sort *follows its column*: work out where the moved
+                // column ended up by applying the same permutation to an
+                // identity list.
+                if let Some(sort) = &mut self.sort {
+                    let mut positions: Vec<usize> = (0..self.order.len()).collect();
+                    advanced_table::reorder(&mut positions, from, to);
+
+                    if let Some(now) = positions.iter().position(|&was| was == sort.column) {
+                        sort.column = now;
+                    }
+                }
+
+                self.status = format!("moved column {from} to {to}");
+            }
             Message::Copy => {
                 let text = self.clipboard_text();
 
@@ -430,89 +558,26 @@ impl Demo {
 
         // Two header shapes off the same column set, so the flat path and the
         // three-level path can be compared without changing anything else.
-        let headers = if self.groups {
-            vec![
-                pin(
-                    leaf(text("ID"))
-                        .fixed(70.0)
-                        .align(alignment::Horizontal::Right)
-                        .sortable(),
-                    self.sticky,
-                ),
-                pin(
-                    group(
-                        text("Contact"),
-                        vec![
-                            leaf(text("First")).fill(1).sortable(),
-                            leaf(text("Last")).fill(2).sortable(),
-                        ],
-                    ),
-                    self.sticky,
-                ),
-                // This label is wider than the four numeric columns beneath it,
-                // which is what exercises apply_span_constraints.
-                group(
-                    text("Financials (Restated, Unaudited)"),
-                    vec![
-                        group(
-                            text("Q3"),
-                            vec![
-                                leaf(text("Revenue"))
-                                    .align(alignment::Horizontal::Right)
-                                    .sortable(),
-                                leaf(text("Cost"))
-                                    .align(alignment::Horizontal::Right)
-                                    .sortable(),
-                            ],
-                        ),
-                        group(
-                            text("Q4"),
-                            vec![
-                                leaf(text("Revenue"))
-                                    .align(alignment::Horizontal::Right)
-                                    .sortable(),
-                                leaf(text("Cost"))
-                                    .align(alignment::Horizontal::Right)
-                                    .sortable(),
-                            ],
-                        ),
-                    ],
-                ),
-                leaf(text("Actions")).fixed(110.0),
-            ]
+        // Built from `order`, so a reorder is genuinely reflected rather than
+        // just reported. Sticky is applied to the first two *top-level* nodes
+        // whatever they now are, which keeps it a leading run.
+        let headers: Vec<_> = if self.groups {
+            self.grouped_headers()
         } else {
-            vec![
-                pin(
-                    leaf(text("ID"))
-                        .fixed(70.0)
-                        .align(alignment::Horizontal::Right)
-                        .sortable(),
-                    self.sticky,
-                ),
-                pin(leaf(text("First")).fill(1).sortable(), self.sticky),
-                leaf(text("Last")).fill(2).sortable(),
-                leaf(text("Q3 Revenue"))
-                    .align(alignment::Horizontal::Right)
-                    .sortable(),
-                leaf(text("Q3 Cost"))
-                    .align(alignment::Horizontal::Right)
-                    .sortable(),
-                leaf(text("Q4 Revenue"))
-                    .align(alignment::Horizontal::Right)
-                    .sortable(),
-                leaf(text("Q4 Cost"))
-                    .align(alignment::Horizontal::Right)
-                    .sortable(),
-                leaf(text("Actions")).fixed(110.0),
-            ]
-        };
+            self.order.iter().map(|&l| self.column_header(l)).collect()
+        }
+        .into_iter()
+        .enumerate()
+        .map(|(i, node)| pin(node, self.sticky && i < 2))
+        .collect();
 
         let stripes = self.stripes;
         let conditional = self.conditional;
         let records = &self.records;
+        let order = self.order.clone();
 
         let mut table = DataTable::new(headers)
-            .rows(&self.records, |record, column| match column {
+            .rows(&self.records, |record, column| match order[column] {
                 0 => text(record.id).into(),
                 1 => text(record.first).into(),
                 2 => text(record.last).into(),
@@ -540,6 +605,7 @@ impl Demo {
             .sorting(self.sort, Message::SortChanged)
             .on_right_click(Message::RightClicked)
             .on_copy(|| Message::Copy)
+            .on_reorder(Message::Reordered)
             .overflow(match self.overflow {
                 OverflowChoice::Scroll => Overflow::Scroll,
                 OverflowChoice::Shrink => Overflow::Shrink,
@@ -571,7 +637,7 @@ impl Demo {
                     return CellStyle::default();
                 };
 
-                let (revenue, cost) = match cell.column {
+                let (revenue, cost) = match order[cell.column] {
                     3 | 4 => (record.q3_revenue, record.q3_cost),
                     5 | 6 => (record.q4_revenue, record.q4_cost),
                     _ => return CellStyle::default(),
@@ -580,7 +646,7 @@ impl Demo {
                 let palette = theme.palette();
                 let profitable = revenue > cost * 2;
 
-                match cell.column {
+                match order[cell.column] {
                     // Revenue: colour alone, so the number still reads as a
                     // number rather than as a badge.
                     3 | 5 if profitable => CellStyle::default().color(palette.success.base.color),

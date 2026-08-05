@@ -158,6 +158,14 @@ pub struct HeaderCell {
     /// a group with a single child covers one column and would be mistaken for
     /// the column itself.
     pub leaf: bool,
+    /// Index into `cells` of the group this node hangs off, or `None` at the
+    /// top level.
+    ///
+    /// Stored rather than derived. Working a parent out by looking for the
+    /// smallest cell that contains this one happens to be right today, but it
+    /// silently picks the wrong answer the moment two levels span the same
+    /// leaves -- a group with one child does exactly that.
+    pub parent: Option<usize>,
 }
 
 impl HeaderCell {
@@ -175,6 +183,68 @@ impl HeaderCell {
     pub fn covers(&self, row: usize) -> bool {
         row >= self.top && row < self.bottom()
     }
+}
+
+/// Where a dragged leaf column may legally be dropped, as leaf-index
+/// boundaries in the current order.
+///
+/// A move has to keep every group's leaves contiguous, or the whole span model
+/// collapses -- a group whose columns are no longer adjacent has no rectangle
+/// to draw its label in. So a node may only move **among its own siblings**,
+/// and the legal boundaries are the edges between those siblings.
+///
+/// For a top-level leaf the siblings include whole groups, so it steps over a
+/// group in one move rather than landing inside it. That is also the intuitive
+/// result: dropping a column "after Contact" means after all of Contact.
+///
+/// The two boundaries either side of the column's current position **are**
+/// included, even though landing on them changes nothing. They are what lets
+/// the drop indicator rest where the column already is, so picking a column up
+/// and putting it down without meaning to move it is a no-op rather than a
+/// forced move to the nearest neighbour.
+///
+/// `frozen` is the sticky prefix. Boundaries that would carry the column across
+/// it are dropped, since crossing would silently change which columns are
+/// pinned.
+pub fn drop_slots(cells: &[HeaderCell], column: usize, frozen: usize) -> Vec<usize> {
+    let Some(dragged) = cells.iter().find(|cell| cell.is_leaf() && cell.start == column) else {
+        return Vec::new();
+    };
+
+    let mut siblings: Vec<&HeaderCell> = cells
+        .iter()
+        .filter(|cell| cell.parent == dragged.parent)
+        .collect();
+
+    siblings.sort_by_key(|cell| cell.start);
+
+    let mut slots: Vec<usize> = siblings.iter().map(|cell| cell.start).collect();
+
+    if let Some(last) = siblings.last() {
+        slots.push(last.end + 1);
+    }
+
+    // Stated in terms of the index the column *ends up at*, which is `slot`
+    // when moving left and `slot - 1` when moving right -- writing the test
+    // against the raw slot instead is off by one on exactly one side, and shows
+    // up as a column that cannot be dropped immediately after the frozen run.
+    slots
+        .into_iter()
+        .filter(|&slot| {
+            if column < frozen {
+                slot <= frozen
+            } else {
+                slot >= frozen
+            }
+        })
+        .collect()
+}
+
+/// Would dropping `column` at `slot` actually change the order?
+///
+/// False for the two boundaries touching the column's current position.
+pub fn is_move(column: usize, slot: usize) -> bool {
+    slot != column && slot != column + 1
 }
 
 /// The result of flattening the header tree.
@@ -237,7 +307,7 @@ pub fn flatten<'a, Message, Theme, Renderer>(
     };
 
     for node in nodes {
-        walk(node, depth, 0, &mut out);
+        walk(node, depth, 0, None, &mut out);
     }
 
     out
@@ -256,6 +326,7 @@ fn walk<'a, Message, Theme, Renderer>(
     node: HeaderNode<'a, Message, Theme, Renderer>,
     total_rows: usize,
     natural: usize,
+    parent: Option<usize>,
     out: &mut Flattened<'a, Message, Theme, Renderer>,
 ) -> (usize, usize) {
     let element = out.elements.len();
@@ -281,6 +352,7 @@ fn walk<'a, Message, Theme, Renderer>(
                 row_span: total_rows.saturating_sub(natural).max(1),
                 top: natural,
                 leaf: true,
+                parent,
             });
             (index, index)
         }
@@ -297,6 +369,7 @@ fn walk<'a, Message, Theme, Renderer>(
                 row_span: 1,
                 top: natural,
                 leaf: false,
+                parent,
             });
 
             let mut start = usize::MAX;
@@ -310,7 +383,7 @@ fn walk<'a, Message, Theme, Renderer>(
                 // Children hang off the row this group's *label* landed on,
                 // not off `natural` -- a group pushed down to meet its
                 // children has to take them with it.
-                let (s, e) = walk(child, total_rows, row + 1, out);
+                let (s, e) = walk(child, total_rows, row + 1, Some(slot), out);
                 start = start.min(s);
                 end = end.max(e);
             }
@@ -374,6 +447,104 @@ mod tests {
         let name = f.cells.iter().find(|c| c.start == 0 && c.is_leaf()).unwrap();
         assert_eq!(name.row, 0);
         assert_eq!(name.row_span, 2);
+    }
+
+    fn demo_header() -> Flattened<'static, (), iced::Theme, iced::Renderer> {
+        flatten(vec![
+            text_leaf("ID"),
+            group(
+                iced::widget::text("Contact"),
+                vec![text_leaf("First"), text_leaf("Last")],
+            ),
+            group(
+                iced::widget::text("Financials"),
+                vec![
+                    group(
+                        iced::widget::text("Q3"),
+                        vec![text_leaf("Rev"), text_leaf("Cost")],
+                    ),
+                    group(
+                        iced::widget::text("Q4"),
+                        vec![text_leaf("Rev"), text_leaf("Cost")],
+                    ),
+                ],
+            ),
+            text_leaf("Actions"),
+        ])
+    }
+
+    #[test]
+    fn a_nested_leaf_may_only_move_within_its_own_group() {
+        // "First" (leaf 1) lives in Contact with "Last" (leaf 2). Its only real
+        // move is past Last -- landing anywhere else would tear Contact apart.
+        let f = demo_header();
+        let slots = drop_slots(&f.cells, 1, 0);
+
+        assert_eq!(slots, vec![1, 2, 3]);
+        assert_eq!(
+            slots.iter().filter(|&&s| is_move(1, s)).collect::<Vec<_>>(),
+            vec![&3],
+        );
+    }
+
+    #[test]
+    fn resting_where_it_already_is_is_always_offered() {
+        // Both boundaries touching the column survive, so the indicator has
+        // somewhere neutral to sit and a stray nudge is not a forced move.
+        let f = demo_header();
+
+        for column in [0, 1, 4, 7] {
+            let slots = drop_slots(&f.cells, column, 0);
+
+            assert!(slots.contains(&column), "column {column} cannot stay put");
+            assert!(!is_move(column, column));
+            assert!(!is_move(column, column + 1));
+        }
+    }
+
+    #[test]
+    fn a_top_level_leaf_steps_over_whole_groups() {
+        // "ID" (leaf 0) is top level, so its siblings are Contact (1..=2),
+        // Financials (3..=6) and Actions (7). It can land after any of them --
+        // never *inside* one.
+        let f = demo_header();
+
+        assert_eq!(drop_slots(&f.cells, 0, 0), vec![0, 1, 3, 7, 8]);
+    }
+
+    #[test]
+    fn the_frozen_boundary_is_not_crossed() {
+        // With ID and Contact pinned, ID may move within the frozen run but not
+        // out of it -- crossing would silently change what is pinned.
+        let f = demo_header();
+
+        assert_eq!(drop_slots(&f.cells, 0, 3), vec![0, 1, 3]);
+
+        // A scrolling column cannot move into the frozen run -- but it *can*
+        // land immediately after it, which is the first position it is allowed
+        // to occupy and the one an off-by-one here would swallow.
+        let slots = drop_slots(&f.cells, 7, 3);
+
+        assert_eq!(slots, vec![3, 7, 8]);
+        assert!(slots.contains(&3), "must be able to lead the scrolling run");
+    }
+
+    #[test]
+    fn a_parent_is_the_group_a_node_hangs_off() {
+        let f = demo_header();
+
+        let id = f.cells.iter().find(|c| c.is_leaf() && c.start == 0).unwrap();
+        assert_eq!(id.parent, None, "top-level nodes have no parent");
+
+        let q3_rev = f.cells.iter().find(|c| c.is_leaf() && c.start == 3).unwrap();
+        let q3 = f.cells[q3_rev.parent.unwrap()];
+        assert!(!q3.is_leaf());
+        assert_eq!((q3.start, q3.end), (3, 4));
+
+        // ...and Q3's own parent is Financials, not the root.
+        let financials = f.cells[q3.parent.unwrap()];
+        assert_eq!((financials.start, financials.end), (3, 6));
+        assert_eq!(financials.parent, None);
     }
 
     #[test]

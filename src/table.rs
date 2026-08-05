@@ -62,6 +62,10 @@ const SORT_ZONE: f32 = 16.0;
 /// Width of the arrows drawn inside that zone.
 const SORT_ARROW: f32 = 8.0;
 
+/// How far the pointer must travel before a press on a header becomes a
+/// reorder rather than a click that selects the column.
+const REORDER_THRESHOLD: f32 = 4.0;
+
 /// Clear space between a header's label and its sort control.
 ///
 /// Reserved on top of `SORT_ZONE` rather than taken out of it, so the gap does
@@ -110,6 +114,7 @@ where
 
     on_right_click: Option<Box<dyn Fn(Click) -> Message + 'a>>,
     on_copy: Option<Box<dyn Fn() -> Message + 'a>>,
+    on_reorder: Option<Box<dyn Fn(usize, usize) -> Message + 'a>>,
 
     cell_mode: Mode,
     selected_cells: BTreeSet<CellPosition>,
@@ -195,6 +200,8 @@ struct State {
 
     /// A sweep in progress. Ephemeral, like the anchors.
     drag: Option<Drag>,
+    /// A column being dragged to a new position.
+    reorder: Option<ReorderDrag>,
 
     /// Whether the last click landed inside the table.
     ///
@@ -203,6 +210,24 @@ struct State {
     /// Click-to-focus rather than a real focus operation: the widget has no
     /// `Id`, and this is enough to make the keys behave.
     focused: bool,
+}
+
+/// A column being dragged to a new position.
+#[derive(Debug, Clone)]
+struct ReorderDrag {
+    column: usize,
+    /// Pointer x at the press, to measure the threshold from.
+    origin: f32,
+    /// How far into the column the press landed, so the carried chip sits under
+    /// the pointer where it was picked up instead of jumping to centre itself.
+    grab: f32,
+    /// Boundaries this column is allowed to land on, worked out once at the
+    /// press rather than per frame -- they cannot change mid-drag.
+    slots: Vec<usize>,
+    /// The boundary currently under the pointer. `None` until the drag clears
+    /// the threshold, which is what keeps a plain click on a header from
+    /// flashing a drop indicator before it resolves into a selection.
+    target: Option<usize>,
 }
 
 /// A drag-select in progress.
@@ -300,6 +325,7 @@ where
             on_sort: None,
             on_right_click: None,
             on_copy: None,
+            on_reorder: None,
             cell_mode: Mode::None,
             selected_cells: BTreeSet::new(),
             on_select_cell: None,
@@ -490,6 +516,28 @@ where
         self
     }
 
+    /// Let leaf columns be dragged to new positions, and report where they land.
+    ///
+    /// The arguments are leaf column indices, meant exactly as
+    /// [`selection::reorder`](crate::selection::reorder) applies them: remove
+    /// `from`, insert at `to`. For a flat header that is a straight
+    /// `Vec::remove` + `Vec::insert` on your own column list.
+    ///
+    /// The table does **not** reorder itself, for the same reason it does not
+    /// sort itself: the order belongs to your column definitions, and a widget
+    /// that quietly kept its own permutation would disagree with them the
+    /// moment you added or removed a column.
+    ///
+    /// A column may only move **among its own siblings**, and never across the
+    /// frozen boundary. Both constraints exist to keep each group's leaves
+    /// contiguous -- a group whose columns are no longer adjacent has no
+    /// rectangle to draw its label in. So a top-level column steps over a whole
+    /// group in one move rather than landing inside it.
+    pub fn on_reorder(mut self, on_reorder: impl Fn(usize, usize) -> Message + 'a) -> Self {
+        self.on_reorder = Some(Box::new(on_reorder));
+        self
+    }
+
     /// Fire on Ctrl+C (Cmd+C on macOS) while the table has focus and something
     /// is selected.
     ///
@@ -598,6 +646,119 @@ where
 
     fn cell_index(&self, row: usize, column: usize) -> usize {
         self.header_len + row * self.columns.len() + column
+    }
+
+    /// Screen x of a drop boundary -- the gap a column would be inserted into.
+    fn slot_x(&self, slot: usize, bounds: Rectangle, state: &State) -> Option<f32> {
+        let last = state.widths.len().checked_sub(1)?;
+
+        let content = if slot < state.offsets.len() {
+            state.offsets[slot] - self.spacing / 2.0
+        } else {
+            state.offsets[last] + state.widths[last] + self.spacing / 2.0
+        };
+
+        Some(screen_x(content, bounds, state))
+    }
+
+    /// Continue an in-progress column reorder. Returns whether the event was
+    /// consumed.
+    fn drag_reorder(
+        &self,
+        tree: &mut Tree,
+        event: &Event,
+        bounds: Rectangle,
+        cursor: mouse::Cursor,
+        shell: &mut Shell<'_, Message>,
+    ) -> bool {
+        match event {
+            Event::Mouse(mouse::Event::CursorMoved { .. })
+            | Event::Touch(touch::Event::FingerMoved { .. }) => {
+                let Some(point) = cursor.position() else {
+                    return false;
+                };
+
+                let Some((column, origin, slots)) = ({
+                    let state = tree.state.downcast_ref::<State>();
+
+                    state
+                        .reorder
+                        .as_ref()
+                        .map(|drag| (drag.column, drag.origin, drag.slots.clone()))
+                }) else {
+                    return false;
+                };
+
+                // Below the threshold this is still a click. Committing to a
+                // drag on the first pixel of movement makes a header
+                // impossible to click without nudging a column.
+                if (point.x - origin).abs() < REORDER_THRESHOLD {
+                    return false;
+                }
+
+                let nearest = slots
+                    .iter()
+                    .copied()
+                    .filter_map(|slot| {
+                        let state = tree.state.downcast_ref::<State>();
+
+                        self.slot_x(slot, bounds, state)
+                            .map(|x| (slot, (x - point.x).abs()))
+                    })
+                    .min_by(|(_, a), (_, b)| a.total_cmp(b))
+                    .map(|(slot, _)| slot);
+
+                let state = tree.state.downcast_mut::<State>();
+
+                if let Some(drag) = state.reorder.as_mut() {
+                    drag.target = nearest;
+                }
+
+                // Every frame of the drag, not just the ones where the drop
+                // target changed. The carried chip follows the pointer
+                // continuously, so redrawing only on a target change leaves it
+                // frozen wherever the line last moved.
+                let _ = column;
+                shell.request_redraw();
+                shell.capture_event();
+                true
+            }
+
+            Event::Mouse(mouse::Event::ButtonReleased(mouse::Button::Left))
+            | Event::Touch(touch::Event::FingerLifted { .. })
+            | Event::Touch(touch::Event::FingerLost { .. }) => {
+                let Some(drag) = tree.state.downcast_mut::<State>().reorder.take() else {
+                    return false;
+                };
+
+                // No target at all means the threshold was never cleared, so
+                // this was a click and the column selection it made on press
+                // stands. A target that is not a *move* means the column was
+                // picked up and put back down where it started -- also nothing
+                // to report, and the case that made a small nudge shove the
+                // column onto its neighbour.
+                let Some(slot) = drag.target.filter(|&slot| header::is_move(drag.column, slot))
+                else {
+                    shell.request_redraw();
+                    return false;
+                };
+
+                // A slot is a gap in the *current* order. Taking the column out
+                // first shifts everything above it down, so a rightward move
+                // lands one place short unless the index is stepped back.
+                let to = if slot > drag.column { slot - 1 } else { slot };
+
+                if let Some(on_reorder) = &self.on_reorder {
+                    shell.publish(on_reorder(drag.column, to));
+                }
+
+                shell.capture_event();
+                shell.request_redraw();
+                true
+            }
+
+            _ => false,
+        }
     }
 
     /// Continue an in-progress drag-select. Returns whether the event was
@@ -1007,14 +1168,42 @@ fn arrow<Renderer: renderer::Renderer>(
     }
 }
 
-/// The region below the header -- the part that scrolls vertically.
-fn body_region(bounds: Rectangle, header_height: f32) -> Rectangle {
-    Rectangle {
+/// The region below the header, split into the part content may use and the
+/// full strip the scrollbars are placed in.
+///
+/// They differ by the horizontal bar's thickness. The bar is an overlay drawn
+/// along the bottom of the full strip, so content allowed to reach that far
+/// ends up *underneath* it -- and because the bar also caps how far the content
+/// can scroll, the last row could never be brought clear of it. Reserving the
+/// strip up front costs one row's worth of viewport and makes the bottom row
+/// reachable.
+fn body_regions(
+    bounds: Rectangle,
+    header_height: f32,
+    content_width: f32,
+    scrollbar_width: f32,
+    horizontal: Policy,
+) -> (Rectangle, Rectangle) {
+    let bars = Rectangle {
         x: bounds.x,
         y: bounds.y + header_height,
         width: bounds.width,
         height: (bounds.height - header_height).max(0.0),
-    }
+    };
+
+    let reserved = if horizontal == Policy::Auto && content_width > bars.width {
+        scrollbar_width
+    } else {
+        0.0
+    };
+
+    (
+        Rectangle {
+            height: (bars.height - reserved).max(0.0),
+            ..bars
+        },
+        bars,
+    )
 }
 
 /// Screen x for a point in content space.
@@ -1463,7 +1652,18 @@ where
 
         // Content may have shrunk since the last frame (a filter was applied,
         // rows were deleted). Re-clamp so we are never scrolled past the end.
-        let viewport = Size::new(size.width, (size.height - header_height).max(0.0));
+        //
+        // Minus the horizontal bar's strip, matching `body_regions`: if the
+        // clamp thinks the viewport reaches the bottom of the widget, it stops
+        // scrolling one bar-height early and the last row stays trapped
+        // underneath the bar.
+        let bar = if self.horizontal == Policy::Auto && content_width > size.width {
+            self.scrollbar_width
+        } else {
+            0.0
+        };
+
+        let viewport = Size::new(size.width, (size.height - header_height - bar).max(0.0));
         state.offset = scroll::clamp_offset(state.offset, viewport, state.content);
 
         layout::Node::with_children(size, nodes)
@@ -1487,7 +1687,13 @@ where
             return;
         }
 
-        let body = body_region(bounds, state.header_height);
+        let (body, bars) = body_regions(
+            bounds,
+            state.header_height,
+            state.content.width,
+            self.scrollbar_width,
+            self.horizontal,
+        );
         let offset = state.offset;
         let columns = self.columns.len();
 
@@ -2265,7 +2471,7 @@ where
         // what actually puts the scrollbars on top of the stripes and rules.
         // ------------------------------------------------------------------
         let (vertical, horizontal) = scroll::scrollbars(
-            body,
+            bars,
             state.content,
             offset,
             self.scrollbar_width,
@@ -2308,6 +2514,111 @@ where
         // of the drag, so the moving edge *is* the feedback -- a second mark
         // drawn over it only competes with the thing it was meant to point at.
         // It existed to stand in for the live update that was missing.
+
+        // The reorder overlay: a chip carrying the column's own header under
+        // the pointer, plus a line showing where it would land.
+        //
+        // The chip matters more than it looks. Without it the only feedback is
+        // a line somewhere else on screen, and the gesture reads as "poking at
+        // the header" rather than as picking the column up and putting it
+        // down -- which is the thing that makes the drag legible at all.
+        if let Some(drag) = state.reorder.as_ref().filter(|drag| drag.target.is_some()) {
+            let carried = self
+                .header_cells
+                .iter()
+                .find(|cell| cell.is_leaf() && cell.start == drag.column);
+
+            renderer.with_layer(bounds, |renderer| {
+                if let (Some(slot), Some(color)) = (drag.target, appearance.reorder_indicator) {
+                    if let Some(x) = self.slot_x(slot, bounds, state) {
+                        let width = (appearance.divider_width() * 2.0).max(2.0);
+
+                        renderer.fill_quad(
+                            renderer::Quad {
+                                bounds: Rectangle {
+                                    x: x - width / 2.0,
+                                    // The leaf band only. A full-height rule
+                                    // competes with the frozen seam and the
+                                    // column dividers it is drawn over; kept to
+                                    // the row the columns are named on, it
+                                    // reads as an insertion point.
+                                    y: bounds.y
+                                        + state.header_row_height
+                                            * self.header_rows.saturating_sub(1) as f32,
+                                    width,
+                                    height: state.header_row_height,
+                                },
+                                ..Default::default()
+                            },
+                            color,
+                        );
+                    }
+                }
+
+                let Some((cell, point)) = carried.zip(cursor.position()) else {
+                    return;
+                };
+
+                let chip = Rectangle {
+                    x: point.x - drag.grab,
+                    y: point.y - state.header_row_height / 2.0,
+                    width: state.widths[drag.column],
+                    height: state.header_row_height,
+                };
+
+                if let Some(background) = appearance.reorder_carry_background {
+                    renderer.fill_quad(
+                        renderer::Quad {
+                            bounds: chip,
+                            border: Border {
+                                color: appearance
+                                    .reorder_indicator
+                                    .unwrap_or(Color::TRANSPARENT),
+                                width: appearance.divider_width(),
+                                radius: 3.0.into(),
+                            },
+                            ..Default::default()
+                        },
+                        background,
+                    );
+                }
+
+                // The label is the real header widget, drawn a second time at an
+                // offset. Its layout node stays where it is -- translating the
+                // renderer is the same trick the whole widget uses to scroll.
+                //
+                // The shift moves the column's whole *box*, not the element, so
+                // whatever alignment the label has inside its cell survives the
+                // trip. Anchoring on the element's own bounds instead would
+                // flush a right-aligned header against the left of the chip.
+                let band = Rectangle {
+                    x: bounds.x + state.offsets[drag.column],
+                    y: bounds.y + state.header_row_height * cell.row as f32,
+                    width: chip.width,
+                    height: chip.height,
+                };
+
+                renderer.with_layer(chip, |renderer| {
+                    renderer.with_translation(
+                        Vector::new(chip.x - band.x, chip.y - band.y),
+                        |renderer| {
+                            self.elements[cell.element].as_widget().draw(
+                                &tree.children[cell.element],
+                                renderer,
+                                theme,
+                                &header_style,
+                                layout.child(cell.element),
+                                mouse::Cursor::Unavailable,
+                                // Untranslated: children cull against their own
+                                // layout coordinates, which the translation has
+                                // not touched.
+                                &band,
+                            );
+                        },
+                    );
+                });
+            });
+        }
 
         // ------------------------------------------------------------------
         // Frame -- last, and in its own layer.
@@ -2375,10 +2686,16 @@ where
             )
         };
 
-        let body = body_region(bounds, header_height);
+        let (body, bars) = body_regions(
+            bounds,
+            header_height,
+            content.width,
+            self.scrollbar_width,
+            self.horizontal,
+        );
         let viewport_size = Size::new(body.width, body.height);
         let (vertical, horizontal) = scroll::scrollbars(
-            body,
+            bars,
             content,
             offset,
             self.scrollbar_width,
@@ -2477,6 +2794,15 @@ where
                 }
                 _ => {}
             }
+        }
+
+        // --- 1b. column reorder, once one is armed ---
+        //
+        // Ahead of everything below it: while a column is being dragged the
+        // pointer is still inside the header, and every other handler there
+        // would happily claim the same movement.
+        if self.drag_reorder(tree, event, bounds, cursor, shell) {
+            return;
         }
 
         // --- 2. scrollbar interaction ---
@@ -2954,17 +3280,60 @@ where
                         )
                     };
 
+                    // A plain press on a leaf header arms a reorder. It only
+                    // *becomes* one past the threshold, so the click still
+                    // selects the column either way.
+                    //
+                    // With a modifier held the gesture stays a selection sweep:
+                    // Ctrl and Shift mean "extend the selection" everywhere
+                    // else in this widget, and reordering on them would make
+                    // the header the one place they mean something different.
+                    let reordering = self.on_reorder.is_some()
+                        && cell.is_leaf()
+                        && !toggle
+                        && !modifiers.shift();
+
+                    let slots = if reordering {
+                        header::drop_slots(&self.header_cells, cell.start, self.sticky_columns)
+                    } else {
+                        Vec::new()
+                    };
+
+                    // More than one slot means at least one of them is a real
+                    // move; a lone slot is the column's own position.
+                    if slots.len() > 1 {
+                        let pointer = cursor.position().map(|point| point.x).unwrap_or_default();
+                        let left = screen_x(state.offsets[cell.start], bounds, state);
+
+                        state.reorder = Some(ReorderDrag {
+                            column: cell.start,
+                            origin: pointer,
+                            grab: pointer - left,
+                            slots,
+                            target: None,
+                        });
+                    }
+
                     if let Some(outcome) = outcome {
                         state.column_anchor = outcome.anchor.or(Some(cell.start));
                         state.column_focus = Some(cell.end);
-                        state.drag = Some(Drag {
-                            kind: DragKind::Column,
-                            base: DragBase::Linear(if toggle {
-                                outcome.selection.clone()
-                            } else {
-                                BTreeSet::new()
-                            }),
-                        });
+
+                        // Only one drag at a time. A column sweep and a reorder
+                        // are the same gesture on the same pixels, and running
+                        // both means the selection smears out behind the column
+                        // you are dragging.
+                        state.drag = if state.reorder.is_some() {
+                            None
+                        } else {
+                            Some(Drag {
+                                kind: DragKind::Column,
+                                base: DragBase::Linear(if toggle {
+                                    outcome.selection.clone()
+                                } else {
+                                    BTreeSet::new()
+                                }),
+                            })
+                        };
 
                         if let Some(on_select) = &self.on_select_column {
                             shell.publish(on_select(outcome.selection));
@@ -3045,10 +3414,16 @@ where
     ) -> mouse::Interaction {
         let state = tree.state.downcast_ref::<State>();
         let bounds = layout.bounds();
-        let body = body_region(bounds, state.header_height);
+        let (body, bars) = body_regions(
+            bounds,
+            state.header_height,
+            state.content.width,
+            self.scrollbar_width,
+            self.horizontal,
+        );
 
         let (vertical, horizontal) = scroll::scrollbars(
-            body,
+            bars,
             state.content,
             state.offset,
             self.scrollbar_width,
@@ -3056,7 +3431,13 @@ where
             self.horizontal,
         );
 
-        if state.y_grab.is_some() || state.x_grab.is_some() {
+        if state.y_grab.is_some()
+            || state.x_grab.is_some()
+            || state
+                .reorder
+                .as_ref()
+                .is_some_and(|drag| drag.target.is_some())
+        {
             return mouse::Interaction::Grabbing;
         }
 

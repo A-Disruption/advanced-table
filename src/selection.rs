@@ -81,6 +81,23 @@ pub fn rectangle(a: CellPosition, b: CellPosition) -> BTreeSet<CellPosition> {
     .collect()
 }
 
+/// Move the item at `from` so that it ends up at index `to`.
+///
+/// `to` is the index the item should occupy **once it has been taken out**,
+/// which is what [`DataTable::on_reorder`] reports -- one less than the gap it
+/// was dropped into whenever the column moved right. Provided so that
+/// adjustment has a single definition instead of one per caller.
+///
+/// [`DataTable::on_reorder`]: crate::DataTable::on_reorder
+pub fn reorder<T>(items: &mut Vec<T>, from: usize, to: usize) {
+    if from == to || from >= items.len() || to >= items.len() {
+        return;
+    }
+
+    let item = items.remove(from);
+    items.insert(to, item);
+}
+
 /// Lay a cell selection out as the rectangle enclosing it, in reading order.
 ///
 /// Spreadsheets exchange a **rectangle**: tabs between columns, newlines

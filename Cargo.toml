@@ -6,6 +6,7 @@ edition = "2021"
 [dependencies]
 iced = { git = "https://github.com/iced-rs/iced", rev = "4cad51ba61e3d76a7e696ad5923d675a20994e34", features = [
     "advanced",
+    "debug"
 ] }
  
 [profile.dev]

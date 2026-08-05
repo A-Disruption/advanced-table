@@ -48,6 +48,16 @@ pub struct Style {
     /// of the header. Making this heavier than `column_divider` is what reads
     /// as "these columns belong together" rather than as one flat grid.
     pub group_divider: Option<Color>,
+    /// Fill behind the chip that carries a column's header under the pointer
+    /// while it is being dragged. `None` draws no chip, leaving only the drop
+    /// line -- which makes the gesture read as poking at the header rather than
+    /// as picking the column up.
+    pub reorder_carry_background: Option<Background>,
+    /// Marks where a dragged column would land if released now, on the leaf
+    /// header band only. Kept to the row the columns are named on rather than
+    /// run full height, so it reads as an insertion point instead of competing
+    /// with the frozen seam and the column rules it crosses.
+    pub reorder_indicator: Option<Color>,
     /// Vertical rule along the seam between frozen and scrolling columns, run
     /// the full height of the table over both. Make it the heaviest rule in the
     /// style -- it separates two things that move independently, which is a
@@ -197,6 +207,8 @@ pub fn default(theme: &Theme) -> Style {
         // is a stronger statement than a column boundary, and drawing both at
         // the same weight is what flattens a three-level header into a grid.
         group_divider: Some(palette.background.strongest.color),
+        reorder_carry_background: Some(palette.background.strong.color.into()),
+        reorder_indicator: Some(palette.background.base.text),
         frozen_divider: Some(palette.background.strongest.color),
         gutter_divider: Some(palette.background.strong.color),
         row_divider: Some(palette.background.strong.color),
@@ -204,7 +216,7 @@ pub fn default(theme: &Theme) -> Style {
         header_text: Some(palette.background.base.text),
         group_text: Some(palette.background.weak.text),
         text: None,
-        sort_indicator: Some(palette.primary.base.color),
+        sort_indicator: Some(palette.primary.base.text),
         sort_indicator_inactive: Some(Color {
             a: 0.35,
             ..palette.background.base.text
@@ -247,6 +259,8 @@ pub fn minimal(theme: &Theme) -> Style {
         border: Border::default(),
         column_divider: None,
         group_divider: Some(palette.background.weak.color),
+        reorder_carry_background: Some(palette.background.weak.color.into()),
+        reorder_indicator: Some(palette.background.base.text),
         frozen_divider: Some(palette.background.strong.color),
         gutter_divider: Some(palette.background.weak.color),
         row_divider: Some(palette.background.weak.color),
