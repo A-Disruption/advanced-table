@@ -23,6 +23,7 @@ name = "advanced-table"
 version = "0.1.0"
 dependencies = [
  "iced",
+ "iced_runtime",
 ]
 
 [[package]]
