@@ -9,6 +9,19 @@ iced = { git = "https://github.com/iced-rs/iced", rev = "4cad51ba61e3d76a7e696ad
     "debug"
 ] }
  
+[dev-dependencies]
+# Drives `UserInterface` headlessly so the per-event cost can be timed without
+# a window or a GPU.
+iced_runtime = { git = "https://github.com/iced-rs/iced", rev = "4cad51ba61e3d76a7e696ad5923d675a20994e34" }
+
+# Release codegen, but with `debug_assertions` left on: iced's null renderer
+# (`impl Renderer for ()`) is gated on it, and `examples/event_bench.rs` needs
+# that to drive the widget without a GPU. Measuring at opt-level 1 would put
+# the numbers an order of magnitude off.
+[profile.measure]
+inherits = "release"
+debug-assertions = true
+
 [profile.dev]
 opt-level = 1
  

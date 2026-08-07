@@ -648,6 +648,23 @@ where
         self.header_len + row * self.columns.len() + column
     }
 
+    /// The body element indices belonging to the rows currently on screen.
+    ///
+    /// `elements` is row-major and contiguous, so a row range maps onto a
+    /// single index range with no gaps. That is what lets a pass be culled to
+    /// the viewport with one range rather than a rectangle test per child.
+    fn visible_body_range(
+        &self,
+        offset_y: f32,
+        body_height: f32,
+        row_height: f32,
+    ) -> std::ops::Range<usize> {
+        let (first, last) = scroll::visible_rows(offset_y, body_height, row_height, self.row_count);
+        let columns = self.columns.len();
+
+        self.header_len + first * columns..self.header_len + last * columns
+    }
+
     /// Screen x of a drop boundary -- the gap a column would be inserted into.
     fn slot_x(&self, slot: usize, bounds: Rectangle, state: &State) -> Option<f32> {
         let last = state.widths.len().checked_sub(1)?;
@@ -1242,6 +1259,34 @@ fn local_cursor(cursor: mouse::Cursor, region: Rectangle, translation: Vector) -
     match cursor.position_over(region) {
         Some(position) => mouse::Cursor::Available(position + translation),
         None => mouse::Cursor::Unavailable,
+    }
+}
+
+/// Whether an event has to reach every row, or only the ones on screen.
+///
+/// Positional events are culled to the viewport: a cell the pointer cannot
+/// possibly be over has nothing to do with them, and `CursorMoved` is the one
+/// event that arrives continuously, so this is where the cost lives.
+///
+/// Everything else is still delivered in full, for two reasons that both cause
+/// real bugs if ignored:
+///
+/// - A cell scrolled out of view can still hold **keyboard focus**. Culling
+///   key events would type into nothing.
+/// - A child that captured a **press** has to see the matching release, or it
+///   is left stuck in its pressed state when scrolled back into view. Wheel
+///   scrolling with the button held is enough to reach that.
+///
+/// Releases are rare, so delivering them everywhere costs nothing that is felt.
+fn reaches_every_row(event: &Event) -> bool {
+    match event {
+        Event::Mouse(mouse::Event::ButtonReleased(_))
+        | Event::Touch(touch::Event::FingerLifted { .. })
+        | Event::Touch(touch::Event::FingerLost { .. }) => true,
+
+        Event::Mouse(_) | Event::Touch(_) => false,
+
+        _ => true,
     }
 }
 
@@ -2918,7 +2963,17 @@ where
             height: body.height,
         };
 
-        for index in 0..self.elements.len() {
+        // Header cells always take the event. Body cells take positional ones
+        // only while they are on screen -- the same range `draw` has always
+        // used, which is what keeps the per-event cost tied to the viewport
+        // instead of the row count.
+        let body_elements = if reaches_every_row(event) {
+            self.header_len..self.elements.len()
+        } else {
+            self.visible_body_range(offset.y, body.height, row_height)
+        };
+
+        for index in (0..self.header_len).chain(body_elements) {
             let is_header = index < self.header_len;
 
             let (child_cursor, child_viewport) = if is_header {
@@ -3482,7 +3537,13 @@ where
         let header_cursor = local_cursor(cursor, header_region, Vector::new(state.offset.x, 0.0));
         let body_cursor = local_cursor(cursor, body, state.offset);
 
-        (0..self.elements.len())
+        // Purely positional, so it is always culled: a row the cursor cannot
+        // be over cannot be the one setting the interaction.
+        let body_elements =
+            self.visible_body_range(state.offset.y, body.height, state.row_height);
+
+        (0..self.header_len)
+            .chain(body_elements)
             .map(|index| {
                 let child_cursor = if index < self.header_len {
                     header_cursor
@@ -3534,19 +3595,53 @@ where
         viewport: &Rectangle,
         translation: Vector,
     ) -> Option<iced::advanced::overlay::Element<'b, Message, Theme, Renderer>> {
-        let offset = tree.state.downcast_ref::<State>().offset;
+        let (offset, row_height, header_height) = {
+            let state = tree.state.downcast_ref::<State>();
+            (state.offset, state.row_height, state.header_height)
+        };
 
         // Overlays (menus, tooltips) opened from a scrolled cell have to be
         // pushed by the same amount the cell was visually shifted, or they
         // appear at the unscrolled position.
-        iced::advanced::overlay::from_children(
-            &mut self.elements,
-            tree,
-            layout,
-            renderer,
-            viewport,
-            translation - offset,
-        )
+        let translation = translation - offset;
+
+        // `overlay::from_children` would ask every cell in the table, and
+        // `UserInterface::update` calls this at the top of *every* event pass --
+        // which made it the single most expensive thing a mouse move did on a
+        // large table, dwarfing the event forwarding itself.
+        //
+        // So it is culled like the rest. An overlay owned by a row that has
+        // been scrolled out of view stops being reported: its anchor is off
+        // screen, so it had nowhere correct to draw anyway. The cell keeps its
+        // own state, and the overlay comes back when the row does.
+        let body_height = (layout.bounds().height - header_height).max(0.0);
+        let visible = self.visible_body_range(offset.y, body_height, row_height);
+
+        let header_len = self.header_len;
+        let (header_elements, body_elements) = self.elements.split_at_mut(header_len);
+        let (header_trees, body_trees) = tree.children.split_at_mut(header_len);
+
+        let body = visible.start - header_len..visible.end - header_len;
+
+        let children: Vec<_> = header_elements
+            .iter_mut()
+            .zip(header_trees)
+            .zip(layout.children())
+            .chain(
+                body_elements[body.clone()]
+                    .iter_mut()
+                    .zip(&mut body_trees[body])
+                    .zip(layout.children().skip(visible.start)),
+            )
+            .filter_map(|((child, state), layout)| {
+                child
+                    .as_widget_mut()
+                    .overlay(state, layout, renderer, viewport, translation)
+            })
+            .collect();
+
+        (!children.is_empty())
+            .then(|| iced::advanced::overlay::Group::with_children(children).overlay())
     }
 }
 
@@ -3559,5 +3654,86 @@ where
 {
     fn from(table: DataTable<'a, Message, Theme, Renderer>) -> Self {
         Element::new(table)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::header::leaf;
+
+    const COLUMNS: usize = 8;
+    const ROWS: usize = 1_000;
+
+    fn table() -> DataTable<'static, (), iced::Theme, ()> {
+        let headers = (0..COLUMNS)
+            .map(|_| leaf(iced::widget::Space::new()))
+            .collect();
+
+        let mut table = DataTable::new(headers);
+
+        for _ in 0..ROWS {
+            table.push((0..COLUMNS).map(|_| iced::widget::Space::new().into()));
+        }
+
+        table
+    }
+
+    /// The row ranges here are the ones `scroll::visible_rows` is tested
+    /// against, so this pins the *index* mapping on top of them. An off-by-one
+    /// would silently stop delivering events to the last visible row, which is
+    /// the kind of thing that only shows up as "the bottom row is dead".
+    #[test]
+    fn visible_range_covers_exactly_the_rows_on_screen() {
+        let table = table();
+        let header_len = table.header_len;
+
+        let cell = |row: usize| header_len + row * COLUMNS;
+
+        // At the top, 300px of 30px rows.
+        assert_eq!(table.visible_body_range(0.0, 300.0, 30.0), cell(0)..cell(11));
+
+        // Scrolled a little past the tenth row.
+        assert_eq!(
+            table.visible_body_range(305.0, 300.0, 30.0),
+            cell(10)..cell(21)
+        );
+
+        // Hard against the bottom: clamped to the last row, never past it.
+        let end = table.visible_body_range(29_999.0, 300.0, 30.0);
+        assert_eq!(end, cell(999)..cell(1_000));
+        assert_eq!(end.end, table.elements.len());
+    }
+
+    /// Culling is only ever safe for events that have a position.
+    #[test]
+    fn only_positional_events_are_culled() {
+        let culled = [
+            Event::Mouse(mouse::Event::CursorMoved {
+                position: Point::ORIGIN,
+            }),
+            Event::Mouse(mouse::Event::ButtonPressed(mouse::Button::Left)),
+        ];
+
+        for event in culled {
+            assert!(!reaches_every_row(&event), "{event:?} should be culled");
+        }
+
+        let delivered = [
+            // A cell scrolled out of view can still hold keyboard focus.
+            Event::Keyboard(keyboard::Event::ModifiersChanged(
+                keyboard::Modifiers::default(),
+            )),
+            // And a child that captured the press has to see this, or it stays
+            // stuck looking pressed.
+            Event::Mouse(mouse::Event::ButtonReleased(mouse::Button::Left)),
+        ];
+
+        for event in delivered {
+            assert!(
+                reaches_every_row(&event),
+                "{event:?} must reach every row"
+            );
+        }
     }
 }
