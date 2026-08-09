@@ -40,6 +40,7 @@ use iced::advanced::renderer;
 use iced::advanced::widget::{tree, Operation, Tree};
 use iced::advanced::{Shell, Widget};
 use std::collections::BTreeSet;
+use iced::border::Radius;
 use iced::{
     alignment, keyboard, mouse, touch, Background, Border, Color, Element, Event, Length, Padding,
     Point, Rectangle, Size, Vector,
@@ -1223,6 +1224,197 @@ fn body_regions(
     )
 }
 
+/// The rounded outline every layer has to stay inside.
+///
+/// `iced` clips a layer to a **rectangle**, so a radius on `Style::border`
+/// rounds the frame *line* and nothing under it: the header band, the stripes
+/// and the rules keep their square corners and go on showing outside the arc.
+/// There is no rounded clip to reach for, so each quad is fitted to the shape
+/// on its way to the renderer instead.
+///
+/// Two ways to fit, because a quad can only carry a radius on its **own**
+/// corners:
+///
+/// - A fill that reaches a corner of the frame takes that corner's radius.
+/// - A rule is thinner than the arc, so a radius on it would round away to
+///   nothing. It is shortened along its length instead, back to wherever the
+///   arc has got to by the time it reaches it.
+///
+/// What this cannot reach is the cells' own contents -- those are foreign
+/// widgets drawing themselves, and a `Background` a caller sets on one is its
+/// business, not the table's.
+#[derive(Debug, Clone, Copy)]
+struct Frame {
+    bounds: Rectangle,
+    radius: Radius,
+}
+
+/// Corners in `Radius` order, as (is_left, is_top).
+const CORNERS: [(bool, bool); 4] = [(true, true), (false, true), (false, false), (true, false)];
+
+/// A quad edge this close to the frame's is treated as being on it. Fills are
+/// built from the same numbers the frame is, so the slack only has to absorb
+/// arithmetic, not layout.
+const ON_EDGE: f32 = 0.5;
+
+impl Frame {
+    fn new(bounds: Rectangle, border: Border) -> Self {
+        Self {
+            bounds,
+            radius: border.radius,
+        }
+    }
+
+    /// The same frame seen from inside a layer drawn under `translation`. Body
+    /// quads are built in content space; the frame is in screen space, and
+    /// comparing the two directly is how the corner ends up in the wrong place
+    /// the moment anything is scrolled.
+    fn translated(self, translation: Vector) -> Self {
+        Self {
+            bounds: self.bounds - translation,
+            ..self
+        }
+    }
+
+    /// Fit a quad to the shape. `None` if nothing of it survives, which saves
+    /// the renderer a primitive it would only clip away.
+    fn fit(&self, quad: Rectangle) -> Option<renderer::Quad> {
+        let mut bounds = quad.intersection(&self.bounds)?;
+
+        let arcs = [
+            self.radius.top_left,
+            self.radius.top_right,
+            self.radius.bottom_right,
+            self.radius.bottom_left,
+        ];
+
+        // Which way a rule runs. Shortening its long axis keeps it a rule;
+        // shortening the short one would rub it out.
+        let flat = bounds.width >= bounds.height;
+
+        let mut rounded = [0.0_f32; 4];
+        let mut trim = [0.0_f32; 4]; // left, top, right, bottom
+
+        for (index, (at_left, at_top)) in CORNERS.into_iter().enumerate() {
+            let arc = arcs[index];
+
+            if arc <= 0.0 {
+                continue;
+            }
+
+            // How far the quad already keeps clear of this corner on each axis.
+            // Never negative: `bounds` is inside the frame by construction.
+            let dx = if at_left {
+                bounds.x - self.bounds.x
+            } else {
+                (self.bounds.x + self.bounds.width) - (bounds.x + bounds.width)
+            };
+            let dy = if at_top {
+                bounds.y - self.bounds.y
+            } else {
+                (self.bounds.y + self.bounds.height) - (bounds.y + bounds.height)
+            };
+
+            // Clear of the arc on either axis means clear of it entirely.
+            if dx >= arc || dy >= arc {
+                continue;
+            }
+
+            if bounds.width >= arc && bounds.height >= arc {
+                // Big enough to carry the arc -- but only if it is actually
+                // anchored on both edges. A fill that starts inside the corner
+                // has no edge to round against, and rounding its own corner
+                // would just punch a notch out of the middle of the band.
+                if dx <= ON_EDGE && dy <= ON_EDGE {
+                    // Halved dimensions are the renderer's own clamp; applying
+                    // it here keeps `rounded` honest about what gets drawn.
+                    rounded[index] = arc.min(bounds.width / 2.0).min(bounds.height / 2.0);
+                }
+            } else if flat {
+                let side = if at_left { 0 } else { 2 };
+                trim[side] = trim[side].max(arc_inset(arc, dy) - dx);
+            } else {
+                let side = if at_top { 1 } else { 3 };
+                trim[side] = trim[side].max(arc_inset(arc, dx) - dy);
+            }
+        }
+
+        bounds.x += trim[0];
+        bounds.y += trim[1];
+        bounds.width -= trim[0] + trim[2];
+        bounds.height -= trim[1] + trim[3];
+
+        (bounds.width > 0.0 && bounds.height > 0.0).then(|| renderer::Quad {
+            bounds,
+            border: Border {
+                radius: Radius {
+                    top_left: rounded[0],
+                    top_right: rounded[1],
+                    bottom_right: rounded[2],
+                    bottom_left: rounded[3],
+                },
+                ..Border::default()
+            },
+            ..Default::default()
+        })
+    }
+
+    fn fill<Renderer: renderer::Renderer>(
+        &self,
+        renderer: &mut Renderer,
+        bounds: Rectangle,
+        background: impl Into<Background>,
+    ) {
+        if let Some(quad) = self.fit(bounds) {
+            renderer.fill_quad(quad, background);
+        }
+    }
+
+    /// As [`fill`](Self::fill), for a quad that carries a border of its own.
+    /// The two radii are merged per corner rather than replaced: a scrollbar
+    /// thumb keeps its own rounding everywhere the frame does not impose more.
+    fn fill_bordered<Renderer: renderer::Renderer>(
+        &self,
+        renderer: &mut Renderer,
+        bounds: Rectangle,
+        border: Border,
+        background: impl Into<Background>,
+    ) {
+        if let Some(quad) = self.fit(bounds) {
+            let fitted = quad.border.radius;
+
+            renderer.fill_quad(
+                renderer::Quad {
+                    border: Border {
+                        radius: Radius {
+                            top_left: fitted.top_left.max(border.radius.top_left),
+                            top_right: fitted.top_right.max(border.radius.top_right),
+                            bottom_right: fitted.bottom_right.max(border.radius.bottom_right),
+                            bottom_left: fitted.bottom_left.max(border.radius.bottom_left),
+                        },
+                        ..border
+                    },
+                    ..quad
+                },
+                background,
+            );
+        }
+    }
+}
+
+/// How far in from one edge a corner's arc has come, `depth` along the other.
+///
+/// Zero once past the corner, `radius` at the corner itself -- which is what
+/// makes it usable as "how much to shorten this rule by so it stops at the
+/// outline rather than at the square the outline was cut from".
+fn arc_inset(radius: f32, depth: f32) -> f32 {
+    if depth >= radius {
+        0.0
+    } else {
+        radius - (radius * radius - (radius - depth) * (radius - depth)).sqrt()
+    }
+}
+
 /// Screen x for a point in content space.
 ///
 /// The frozen strip does not move, so anything inside it maps straight through
@@ -1742,17 +1934,20 @@ where
         let offset = state.offset;
         let columns = self.columns.len();
 
+        // The shape everything below is fitted to. Layer clipping is
+        // rectangular, so a radius on the frame is only ever a radius on the
+        // frame unless each band and rule is cut to the outline itself.
+        let frame = Frame::new(bounds, appearance.border);
+
         // Base background only. The frame is drawn at the very end of this
         // method instead of here, because everything below paints over it: the
         // row bands run the full content width, the header band runs the full
         // viewport width, and the stripes run both. Drawn first, a 1px border
         // survives only where nothing happens to cover it -- which is exactly
         // the "border appears on the left of every other row" symptom.
-        renderer.fill_quad(
-            renderer::Quad {
-                bounds,
-                ..Default::default()
-            },
+        frame.fill(
+            renderer,
+            bounds,
             appearance
                 .row_background
                 .unwrap_or(Background::Color(Color::TRANSPARENT)),
@@ -1811,7 +2006,7 @@ where
             ),
         ];
 
-        let mut paint_body = |renderer: &mut Renderer,
+        let paint_body = |renderer: &mut Renderer,
                               region: Rectangle,
                               shift_x: f32,
                               range: std::ops::Range<usize>| {
@@ -1831,6 +2026,10 @@ where
             width: region.width,
             height: region.height,
         };
+
+        // Everything in this layer is built in content space, so the outline it
+        // has to stay inside has to be moved into content space too.
+        let frame = frame.translated(Vector::new(shift_x, -offset.y));
 
         renderer.with_layer(region, |renderer| {
             renderer.with_translation(Vector::new(shift_x, -offset.y), |renderer| {
@@ -1854,13 +2053,7 @@ where
 
                 if let Some(background) = appearance.alternate_row_background {
                     for row in (first..last).filter(|r| r % 2 == 1) {
-                        renderer.fill_quad(
-                            renderer::Quad {
-                                bounds: row_rect(row),
-                                ..Default::default()
-                            },
-                            background,
-                        );
+                        frame.fill(renderer, row_rect(row), background);
                     }
                 }
 
@@ -1870,15 +2063,13 @@ where
                 if let Some(background) = appearance.selected_column_background {
                     for column in &self.selected_columns {
                         if *column < state.widths.len() {
-                            renderer.fill_quad(
-                                renderer::Quad {
-                                    bounds: Rectangle {
-                                        x: bounds.x + state.offsets[*column],
-                                        y: body.y + offset.y,
-                                        width: state.widths[*column],
-                                        height: body.height,
-                                    },
-                                    ..Default::default()
+                            frame.fill(
+                                renderer,
+                                Rectangle {
+                                    x: bounds.x + state.offsets[*column],
+                                    y: body.y + offset.y,
+                                    width: state.widths[*column],
+                                    height: body.height,
                                 },
                                 background,
                             );
@@ -1930,13 +2121,7 @@ where
                     for row in first..last {
                         for column in range.clone() {
                             if let Some(background) = style_of(row, column).background {
-                                renderer.fill_quad(
-                                    renderer::Quad {
-                                        bounds: cell_rect(row, column),
-                                        ..Default::default()
-                                    },
-                                    background,
-                                );
+                                frame.fill(renderer, cell_rect(row, column), background);
                             }
                         }
                     }
@@ -1948,13 +2133,7 @@ where
                     (appearance.hovered_row_background, state.hovered)
                 {
                     if row >= first && row < last && !self.selected.contains(&row) {
-                        renderer.fill_quad(
-                            renderer::Quad {
-                                bounds: row_rect(row),
-                                ..Default::default()
-                            },
-                            background,
-                        );
+                        frame.fill(renderer, row_rect(row), background);
                     }
                 }
 
@@ -1962,13 +2141,7 @@ where
                     // Only the visible slice -- `selected` may hold thousands
                     // of rows after a Shift-range over a large table.
                     for row in self.selected.range(first..last) {
-                        renderer.fill_quad(
-                            renderer::Quad {
-                                bounds: row_rect(*row),
-                                ..Default::default()
-                            },
-                            background,
-                        );
+                        frame.fill(renderer, row_rect(*row), background);
                     }
                 }
 
@@ -1976,17 +2149,13 @@ where
 
                 if let Some(color) = appearance.row_divider {
                     for row in first.max(1)..last {
-                        renderer.fill_quad(
-                            renderer::Quad {
-                                bounds: Rectangle {
-                                    x: bounds.x,
-                                    y: bounds.y
-                                        + state.header_height
-                                        + state.row_height * row as f32,
-                                    width: state.content.width.max(bounds.width),
-                                    height: rule,
-                                },
-                                ..Default::default()
+                        frame.fill(
+                            renderer,
+                            Rectangle {
+                                x: bounds.x,
+                                y: bounds.y + state.header_height + state.row_height * row as f32,
+                                width: state.content.width.max(bounds.width),
+                                height: rule,
                             },
                             color,
                         );
@@ -1995,15 +2164,13 @@ where
 
                 if let Some(color) = appearance.column_divider {
                     for offset_x in state.offsets.iter().skip(1) {
-                        renderer.fill_quad(
-                            renderer::Quad {
-                                bounds: Rectangle {
-                                    x: bounds.x + offset_x - self.spacing / 2.0 - rule / 2.0,
-                                    y: body.y + offset.y,
-                                    width: rule,
-                                    height: body.height,
-                                },
-                                ..Default::default()
+                        frame.fill(
+                            renderer,
+                            Rectangle {
+                                x: bounds.x + offset_x - self.spacing / 2.0 - rule / 2.0,
+                                y: body.y + offset.y,
+                                width: rule,
+                                height: body.height,
                             },
                             color,
                         );
@@ -2014,15 +2181,13 @@ where
                     (appearance.gutter_divider, gutter_edges)
                 {
                     for x in [left, right] {
-                        renderer.fill_quad(
-                            renderer::Quad {
-                                bounds: Rectangle {
-                                    x: x - rule / 2.0,
-                                    y: body.y + offset.y,
-                                    width: rule,
-                                    height: body.height,
-                                },
-                                ..Default::default()
+                        frame.fill(
+                            renderer,
+                            Rectangle {
+                                x: x - rule / 2.0,
+                                y: body.y + offset.y,
+                                width: rule,
+                                height: body.height,
                             },
                             color,
                         );
@@ -2046,14 +2211,12 @@ where
 
                         for (y, draw) in [(band.y, opens), (band.y + band.height - rule, closes)] {
                             if draw {
-                                renderer.fill_quad(
-                                    renderer::Quad {
-                                        bounds: Rectangle {
-                                            y,
-                                            height: rule,
-                                            ..band
-                                        },
-                                        ..Default::default()
+                                frame.fill(
+                                    renderer,
+                                    Rectangle {
+                                        y,
+                                        height: rule,
+                                        ..band
                                     },
                                     color,
                                 );
@@ -2079,13 +2242,7 @@ where
                     let band = cell_rect(position.row, position.column);
 
                     if let Some(background) = appearance.selected_cell_background {
-                        renderer.fill_quad(
-                            renderer::Quad {
-                                bounds: band,
-                                ..Default::default()
-                            },
-                            background,
-                        );
+                        frame.fill(renderer, band, background);
                     }
 
                     // An edge is drawn only where the neighbour on that side is
@@ -2128,13 +2285,7 @@ where
 
                         for (edge, joined) in edges {
                             if !joined {
-                                renderer.fill_quad(
-                                    renderer::Quad {
-                                        bounds: edge,
-                                        ..Default::default()
-                                    },
-                                    color,
-                                );
+                                frame.fill(renderer, edge, color);
                             }
                         }
                     }
@@ -2219,7 +2370,7 @@ where
             ),
         ];
 
-        let mut paint_header = |renderer: &mut Renderer,
+        let paint_header = |renderer: &mut Renderer,
                                 region: Rectangle,
                                 shift_x: f32,
                                 range: std::ops::Range<usize>| {
@@ -2237,16 +2388,17 @@ where
             // stripe -- an ungrouped column has no group, and banding across it
             // draws a group level over a column that is not in one.
             if let Some(background) = appearance.header_background {
-                renderer.fill_quad(
-                    renderer::Quad {
-                        bounds: region,
-                        ..Default::default()
-                    },
-                    background,
-                );
+                frame.fill(renderer, region, background);
             }
 
             renderer.with_translation(Vector::new(shift_x, 0.0), |renderer| {
+                // As in the body: the furniture below is placed in content
+                // space, so the outline it is cut against has to be too. Scoped
+                // to this closure -- the header divider after it is not
+                // translated, and cutting it against a shifted outline would
+                // pull its ends in by the scroll offset.
+                let frame = frame.translated(Vector::new(shift_x, 0.0));
+
                 let rule = appearance.divider_width();
                 let band = state.header_row_height;
                 let foot = bounds.y + state.header_height;
@@ -2257,15 +2409,13 @@ where
 
                 if let Some(background) = appearance.group_background {
                     for cell in self.header_cells.iter().filter(|c| !c.is_leaf()) {
-                        renderer.fill_quad(
-                            renderer::Quad {
-                                bounds: Rectangle {
-                                    x: left(cell),
-                                    y: bounds.y + band * cell.top as f32,
-                                    width: (right(cell) - left(cell)).max(0.0),
-                                    height: band * (cell.bottom() - cell.top) as f32,
-                                },
-                                ..Default::default()
+                        frame.fill(
+                            renderer,
+                            Rectangle {
+                                x: left(cell),
+                                y: bounds.y + band * cell.top as f32,
+                                width: (right(cell) - left(cell)).max(0.0),
+                                height: band * (cell.bottom() - cell.top) as f32,
                             },
                             background,
                         );
@@ -2291,15 +2441,13 @@ where
                     let height = (foot - top).max(0.0);
 
                     let mut rail = |x: f32, color| {
-                        renderer.fill_quad(
-                            renderer::Quad {
-                                bounds: Rectangle {
-                                    x: x - rule / 2.0,
-                                    y: top,
-                                    width: rule,
-                                    height,
-                                },
-                                ..Default::default()
+                        frame.fill(
+                            renderer,
+                            Rectangle {
+                                x: x - rule / 2.0,
+                                y: top,
+                                width: rule,
+                                height,
                             },
                             color,
                         );
@@ -2331,15 +2479,13 @@ where
                     if let Some(color) =
                         appearance.row_divider.filter(|_| cell.bottom() < self.header_rows)
                     {
-                        renderer.fill_quad(
-                            renderer::Quad {
-                                bounds: Rectangle {
-                                    x: left(cell),
-                                    y: bounds.y + band * cell.bottom() as f32 - rule,
-                                    width: (right(cell) - left(cell)).max(0.0),
-                                    height: rule,
-                                },
-                                ..Default::default()
+                        frame.fill(
+                            renderer,
+                            Rectangle {
+                                x: left(cell),
+                                y: bounds.y + band * cell.bottom() as f32 - rule,
+                                width: (right(cell) - left(cell)).max(0.0),
+                                height: rule,
                             },
                             color,
                         );
@@ -2352,15 +2498,13 @@ where
                     (appearance.gutter_divider, gutter_edges)
                 {
                     for x in [left, right] {
-                        renderer.fill_quad(
-                            renderer::Quad {
-                                bounds: Rectangle {
-                                    x: x - rule / 2.0,
-                                    y: bounds.y,
-                                    width: rule,
-                                    height: state.header_height,
-                                },
-                                ..Default::default()
+                        frame.fill(
+                            renderer,
+                            Rectangle {
+                                x: x - rule / 2.0,
+                                y: bounds.y,
+                                width: rule,
+                                height: state.header_height,
                             },
                             color,
                         );
@@ -2373,17 +2517,15 @@ where
 
                         if state.hovered_sort == Some(cell.start) {
                             if let Some(background) = appearance.sort_hovered_background {
-                                renderer.fill_quad(
-                                    renderer::Quad {
-                                        bounds: Rectangle {
-                                            y: zone.center_y() - 9.0,
-                                            height: 18.0,
-                                            ..zone
-                                        },
-                                        border: Border {
-                                            radius: 3.0.into(),
-                                            ..Default::default()
-                                        },
+                                frame.fill_bordered(
+                                    renderer,
+                                    Rectangle {
+                                        y: zone.center_y() - 9.0,
+                                        height: 18.0,
+                                        ..zone
+                                    },
+                                    Border {
+                                        radius: 3.0.into(),
                                         ..Default::default()
                                     },
                                     background,
@@ -2455,14 +2597,12 @@ where
             });
 
             if let Some(color) = appearance.header_divider {
-                renderer.fill_quad(
-                    renderer::Quad {
-                        bounds: Rectangle {
-                            y: bounds.y + state.header_height - appearance.divider_width(),
-                            height: appearance.divider_width(),
-                            ..region
-                        },
-                        ..Default::default()
+                frame.fill(
+                    renderer,
+                    Rectangle {
+                        y: bounds.y + state.header_height - appearance.divider_width(),
+                        height: appearance.divider_width(),
+                        ..region
                     },
                     color,
                 );
@@ -2491,15 +2631,13 @@ where
                 let rule = appearance.divider_width();
 
                 renderer.with_layer(bounds, |renderer| {
-                    renderer.fill_quad(
-                        renderer::Quad {
-                            bounds: Rectangle {
-                                x: bounds.x + frozen - rule,
-                                y: bounds.y,
-                                width: rule,
-                                height: bounds.height,
-                            },
-                            ..Default::default()
+                    frame.fill(
+                        renderer,
+                        Rectangle {
+                            x: bounds.x + frozen - rule,
+                            y: bounds.y,
+                            width: rule,
+                            height: bounds.height,
                         },
                         color,
                     );
@@ -2527,25 +2665,17 @@ where
         renderer.with_layer(bounds, |renderer| {
             for bar in [vertical, horizontal].into_iter().flatten() {
                 if let Some(track) = appearance.scrollbar_track {
-                    renderer.fill_quad(
-                        renderer::Quad {
-                            bounds: bar.track,
-                            ..Default::default()
-                        },
-                        track,
-                    );
+                    frame.fill(renderer, bar.track, track);
                 }
 
                 let hovered = cursor
                     .position()
                     .is_some_and(|point| bar.track.contains(point));
 
-                renderer.fill_quad(
-                    renderer::Quad {
-                        bounds: bar.thumb,
-                        border: appearance.scrollbar_border,
-                        ..Default::default()
-                    },
+                frame.fill_bordered(
+                    renderer,
+                    bar.thumb,
+                    appearance.scrollbar_border,
                     if hovered {
                         appearance.scrollbar_thumb_hovered
                     } else {
@@ -2578,22 +2708,20 @@ where
                     if let Some(x) = self.slot_x(slot, bounds, state) {
                         let width = (appearance.divider_width() * 2.0).max(2.0);
 
-                        renderer.fill_quad(
-                            renderer::Quad {
-                                bounds: Rectangle {
-                                    x: x - width / 2.0,
-                                    // The leaf band only. A full-height rule
-                                    // competes with the frozen seam and the
-                                    // column dividers it is drawn over; kept to
-                                    // the row the columns are named on, it
-                                    // reads as an insertion point.
-                                    y: bounds.y
-                                        + state.header_row_height
-                                            * self.header_rows.saturating_sub(1) as f32,
-                                    width,
-                                    height: state.header_row_height,
-                                },
-                                ..Default::default()
+                        frame.fill(
+                            renderer,
+                            Rectangle {
+                                x: x - width / 2.0,
+                                // The leaf band only. A full-height rule
+                                // competes with the frozen seam and the
+                                // column dividers it is drawn over; kept to
+                                // the row the columns are named on, it
+                                // reads as an insertion point.
+                                y: bounds.y
+                                    + state.header_row_height
+                                        * self.header_rows.saturating_sub(1) as f32,
+                                width,
+                                height: state.header_row_height,
                             },
                             color,
                         );
@@ -2612,17 +2740,15 @@ where
                 };
 
                 if let Some(background) = appearance.reorder_carry_background {
-                    renderer.fill_quad(
-                        renderer::Quad {
-                            bounds: chip,
-                            border: Border {
-                                color: appearance
-                                    .reorder_indicator
-                                    .unwrap_or(Color::TRANSPARENT),
-                                width: appearance.divider_width(),
-                                radius: 3.0.into(),
-                            },
-                            ..Default::default()
+                    frame.fill_bordered(
+                        renderer,
+                        chip,
+                        Border {
+                            color: appearance
+                                .reorder_indicator
+                                .unwrap_or(Color::TRANSPARENT),
+                            width: appearance.divider_width(),
+                            radius: 3.0.into(),
                         },
                         background,
                     );
@@ -3735,5 +3861,192 @@ mod tests {
                 "{event:?} must reach every row"
             );
         }
+    }
+
+    const RADIUS: f32 = 8.0;
+
+    fn frame() -> Frame {
+        Frame::new(
+            Rectangle {
+                x: 100.0,
+                y: 50.0,
+                width: 400.0,
+                height: 300.0,
+            },
+            Border {
+                radius: RADIUS.into(),
+                ..Border::default()
+            },
+        )
+    }
+
+    /// The symptom that started this: a header band drawn square across the top
+    /// of a table with a radius, showing outside the arc at both corners. The
+    /// band has to come back carrying the *frame's* radius, and only on the two
+    /// corners it actually reaches.
+    #[test]
+    fn a_band_takes_the_corners_it_reaches() {
+        let frame = frame();
+
+        let header = frame
+            .fit(Rectangle {
+                x: 100.0,
+                y: 50.0,
+                width: 400.0,
+                height: 30.0,
+            })
+            .expect("the header band survives");
+
+        assert_eq!(header.border.radius.top_left, RADIUS);
+        assert_eq!(header.border.radius.top_right, RADIUS);
+
+        // Nowhere near the bottom of the frame, so those corners stay square --
+        // rounding them would notch the band where it meets the first row.
+        assert_eq!(header.border.radius.bottom_left, 0.0);
+        assert_eq!(header.border.radius.bottom_right, 0.0);
+
+        // A row in the middle of the table reaches no corner at all.
+        let middle = frame
+            .fit(Rectangle {
+                x: 100.0,
+                y: 200.0,
+                width: 400.0,
+                height: 30.0,
+            })
+            .expect("the row survives");
+
+        assert_eq!(middle.border.radius, Radius::default());
+        assert_eq!(middle.bounds.width, 400.0);
+    }
+
+    /// A row band runs the full *content* width, which is wider than the widget
+    /// whenever the table scrolls sideways. Rounding its own far corner would
+    /// put the arc off-screen; it has to be cut to the frame first.
+    #[test]
+    fn an_overhanging_band_is_cut_to_the_frame_before_it_is_rounded() {
+        let last_row = frame()
+            .fit(Rectangle {
+                x: 100.0,
+                y: 320.0,
+                width: 1_200.0,
+                height: 30.0,
+            })
+            .expect("the row survives");
+
+        assert_eq!(last_row.bounds.width, 400.0);
+        assert_eq!(last_row.border.radius.bottom_right, RADIUS);
+        assert_eq!(last_row.border.radius.bottom_left, RADIUS);
+    }
+
+    /// A rule is thinner than the arc, so a radius on it rounds away to
+    /// nothing. It gets shortened to where the outline actually is instead --
+    /// which is the other half of the reported symptom, column lines running
+    /// on past the corner they should have stopped at.
+    #[test]
+    fn a_rule_is_shortened_out_of_the_corner_rather_than_rounded() {
+        let frame = frame();
+
+        // Hard against the left edge, running the full height: both left
+        // corners cut into it, so it loses the whole radius at each end.
+        let rule = frame
+            .fit(Rectangle {
+                x: 100.0,
+                y: 50.0,
+                width: 1.0,
+                height: 300.0,
+            })
+            .expect("the rule survives");
+
+        assert_eq!(rule.border.radius, Radius::default());
+        assert_eq!(rule.bounds.y, 50.0 + RADIUS);
+        assert_eq!(rule.bounds.height, 300.0 - RADIUS * 2.0);
+
+        // Further in, the arc has already turned: the cut is smaller, and it is
+        // still only ever taken off the ends.
+        let inset = frame
+            .fit(Rectangle {
+                x: 100.0 + RADIUS / 2.0,
+                y: 50.0,
+                width: 1.0,
+                height: 300.0,
+            })
+            .expect("the rule survives");
+
+        assert!(inset.bounds.y > 50.0 && inset.bounds.y < 50.0 + RADIUS);
+        assert_eq!(inset.bounds.x, 100.0 + RADIUS / 2.0);
+
+        // Past the corner entirely -- the overwhelming majority of them --
+        // nothing is touched at all.
+        let interior = frame
+            .fit(Rectangle {
+                x: 250.0,
+                y: 50.0,
+                width: 1.0,
+                height: 300.0,
+            })
+            .expect("the rule survives");
+
+        assert_eq!(interior.bounds.y, 50.0);
+        assert_eq!(interior.bounds.height, 300.0);
+    }
+
+    /// Body quads are built in content space and the frame is not, so a scrolled
+    /// table has to compare the two in the same space. Getting this wrong puts
+    /// the corner treatment on whichever row happens to be `radius` px from the
+    /// top of the *content*.
+    #[test]
+    fn the_frame_follows_the_layer_translation() {
+        let offset = Vector::new(0.0, 120.0);
+        let frame = frame().translated(Vector::new(0.0, -offset.y));
+
+        // The row that will land at the bottom of the widget once translated.
+        let row = frame
+            .fit(Rectangle {
+                x: 100.0,
+                y: 50.0 + 300.0 + offset.y - 30.0,
+                width: 400.0,
+                height: 30.0,
+            })
+            .expect("the row survives");
+
+        assert_eq!(row.border.radius.bottom_left, RADIUS);
+
+        // And one two screens further down is outside the frame entirely, so it
+        // never reaches the renderer.
+        assert!(frame
+            .fit(Rectangle {
+                x: 100.0,
+                y: 50.0 + 600.0 + offset.y,
+                width: 400.0,
+                height: 30.0,
+            })
+            .is_none());
+    }
+
+    /// The default style has no radius, and that path has to stay exactly what
+    /// it was: no trimming, no rounding, nothing but the intersection.
+    #[test]
+    fn a_square_frame_changes_nothing() {
+        let frame = Frame::new(
+            Rectangle {
+                x: 100.0,
+                y: 50.0,
+                width: 400.0,
+                height: 300.0,
+            },
+            Border::default(),
+        );
+
+        let quad = Rectangle {
+            x: 100.0,
+            y: 50.0,
+            width: 400.0,
+            height: 30.0,
+        };
+
+        let fitted = frame.fit(quad).expect("the band survives");
+
+        assert_eq!(fitted.bounds, quad);
+        assert_eq!(fitted.border.radius, Radius::default());
     }
 }

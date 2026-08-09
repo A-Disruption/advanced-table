@@ -37,10 +37,14 @@ pub struct Style {
     /// Drawn around the outside of the whole widget, on top of everything else
     /// so no band or stripe can paint over it.
     ///
-    /// A `radius` rounds the frame *line* only. Layer clipping in `iced` is
-    /// rectangular, so the header band and the row stripes underneath still
-    /// have square corners and will show outside the arc. Leave it at zero
-    /// unless the table sits on a background of its own colour.
+    /// A `radius` rounds the whole table, not just the frame line: every band
+    /// and rule the widget draws is cut to the outline first, so the header
+    /// band, the stripes and the column rules all follow the corner. It is not
+    /// a clip, because `iced` only clips to rectangles -- so the one thing it
+    /// cannot round is a *cell's own* contents. A cell holding a widget with a
+    /// background of its own (a `container` filling the cell, say) will still
+    /// square off the corner it sits in; keep the corner cells' backgrounds on
+    /// the table, through [`CellStyle`], and they follow the radius.
     pub border: Border,
     /// Vertical rule between columns. `None` draws nothing.
     pub column_divider: Option<Color>,

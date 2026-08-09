@@ -138,17 +138,15 @@ pub fn scrollbars(
     vertical: Policy,
     horizontal: Policy,
 ) -> (Option<Scrollbar>, Option<Scrollbar>) {
-    let needs_v = vertical == Policy::Auto && content.height > body.height;
     let needs_h = horizontal == Policy::Auto && content.width > body.width;
-
-    // Each bar eats into the other's track, so a bar can appear purely because
-    // the other one appeared. Resolve that before computing geometry.
     let track_height = body.height - if needs_h { width } else { 0.0 };
+    let needs_v = vertical == Policy::Auto && content.height > track_height;
     let track_width = body.width - if needs_v { width } else { 0.0 };
+    let viewport = Size::new(body.width, track_height);
 
     let v = needs_v.then(|| {
-        let length = thumb_length(track_height, track_height, content.height);
-        let start = thumb_position(track_height, track_height, content.height, offset.y);
+        let length = thumb_length(track_height, viewport.height, content.height);
+        let start = thumb_position(track_height, viewport.height, content.height, offset.y);
 
         Scrollbar {
             track: Rectangle {
@@ -167,8 +165,8 @@ pub fn scrollbars(
     });
 
     let h = needs_h.then(|| {
-        let length = thumb_length(track_width, track_width, content.width);
-        let start = thumb_position(track_width, track_width, content.width, offset.x);
+        let length = thumb_length(track_width, viewport.width, content.width);
+        let start = thumb_position(track_width, viewport.width, content.width, offset.x);
 
         Scrollbar {
             track: Rectangle {
@@ -216,6 +214,58 @@ mod tests {
         // This is the assertion that catches the travel-range bug: using
         // `track` instead of `track - thumb` overshoots by ~thumb_len.
         assert!(approx(pos + len, TRACK));
+    }
+
+    /// The same property, but end to end through the geometry the widget
+    /// actually draws -- which is where it was being lost.
+    ///
+    /// `fully_scrolled_puts_thumb_flush_with_track_end` passes whatever
+    /// `scrollbars` hands the mapping, because it does the handing itself. The
+    /// scroll range is set by `clamp_offset` against the *viewport*, so that is
+    /// what the thumb has to be measured against too; measured against its own
+    /// track instead, the horizontal thumb stops one bar-width's worth of
+    /// travel short of the end and never quite gets there.
+    #[test]
+    fn both_thumbs_reach_both_ends_of_their_tracks() {
+        const WIDTH: f32 = 10.0;
+
+        let bars = Rectangle {
+            x: 0.0,
+            y: 0.0,
+            width: 500.0,
+            height: 300.0,
+        };
+
+        // Barely overflowing on each axis, which is the worst case: the gap is
+        // a fraction of the *travel*, so the less there is to scroll the more
+        // of the track the thumb fails to cover.
+        let content = Size::new(560.0, 360.0);
+
+        // Exactly what `layout` clamps the offset against: the full width (the
+        // vertical bar is an overlay), minus the horizontal bar's reserved
+        // strip on the height.
+        let viewport = Size::new(bars.width, bars.height - WIDTH);
+        let max = max_offset(viewport, content);
+
+        let bar = |offset| {
+            let (v, h) = scrollbars(bars, content, offset, WIDTH, Policy::Auto, Policy::Auto);
+
+            (v.expect("vertical bar"), h.expect("horizontal bar"))
+        };
+
+        let (v, h) = bar(Vector::new(0.0, 0.0));
+        assert!(approx(v.thumb.y, v.track.y), "vertical thumb off the top");
+        assert!(approx(h.thumb.x, h.track.x), "horizontal thumb off the left");
+
+        let (v, h) = bar(max);
+        assert!(
+            approx(v.thumb.y + v.thumb.height, v.track.y + v.track.height),
+            "vertical thumb short of the bottom"
+        );
+        assert!(
+            approx(h.thumb.x + h.thumb.width, h.track.x + h.track.width),
+            "horizontal thumb short of the right"
+        );
     }
 
     #[test]
@@ -303,5 +353,31 @@ mod tests {
 
         assert!(approx(v.track.height, 190.0));
         assert!(approx(h.track.width, 190.0));
+    }
+
+    /// The other half of "each bar eats into the other": content that fits the
+    /// body but not what is left of it once the horizontal bar has taken its
+    /// strip is scrollable, so it has to get a bar. Measured against the body,
+    /// the last few pixels scroll with nothing on screen to say they can.
+    #[test]
+    fn a_horizontal_bar_can_be_the_reason_a_vertical_one_is_needed() {
+        let body = Rectangle {
+            x: 0.0,
+            y: 0.0,
+            width: 200.0,
+            height: 200.0,
+        };
+
+        // Taller than the 190 left over, shorter than the body itself.
+        let content = Size::new(500.0, 195.0);
+
+        let (v, h) = scrollbars(body, content, Vector::ZERO, 10.0, Policy::Auto, Policy::Auto);
+
+        assert!(h.is_some(), "the horizontal bar is what starts this");
+        assert!(v.is_some(), "and the strip it takes makes the body overflow");
+
+        // The offset clamp agrees, which is the point: the two are computed
+        // from the same viewport.
+        assert!(max_offset(Size::new(body.width, 190.0), content).y > 0.0);
     }
 }
