@@ -3402,8 +3402,19 @@ where
             }
         }
 
-        // --- 6. column selection from header clicks ---
-        if self.column_mode != Mode::None {
+        // --- 6. column selection from header clicks, and arming a reorder ---
+        //
+        // Reordering is not a kind of selection. A table may offer one, the
+        // other, both or neither, and `on_reorder` documents itself as
+        // independent -- but this block was gated on `column_mode` alone, so a
+        // table that only wanted its columns dragged never reached the code
+        // that arms the drag, and `on_reorder` could not fire at all. Two
+        // unrelated features tied together by nothing but where the code sat.
+        //
+        // With column selection off, `selection::apply` returns `None` for
+        // `Mode::None`, so everything below that belongs to selecting is
+        // skipped and the press falls through having armed only the reorder.
+        if self.column_mode != Mode::None || self.on_reorder.is_some() {
             if let Event::Mouse(mouse::Event::ButtonPressed(mouse::Button::Left)) = event {
                 let header_region = Rectangle {
                     height: header_height,
