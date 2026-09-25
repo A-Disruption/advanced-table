@@ -1604,16 +1604,12 @@ where
         Size::new(self.width, self.height)
     }
 
-    fn layout(
-        &mut self,
-        tree: &mut Tree,
-        renderer: &Renderer,
-        limits: &layout::Limits,
-    ) -> layout::Node {
+    fn layout(&mut self, tree: &mut Tree, renderer: &Renderer, limits: &layout::Limits) {
         let columns = self.columns.len();
 
         if columns == 0 {
-            return layout::Node::new(Size::ZERO);
+            tree.size = Size::ZERO;
+            return;
         }
 
         let h_pad = self.padding.x();
@@ -1644,12 +1640,12 @@ where
 
         for i in 0..self.header_cells.len() {
             let cell = self.header_cells[i];
-            let node = self.elements[cell.element].as_widget_mut().layout(
+            self.elements[cell.element].as_widget_mut().layout(
                 &mut tree.children[cell.element],
                 renderer,
                 &loose,
             );
-            let size = node.size();
+            let size = tree.children[cell.element].size;
             // A sortable column has to be wide enough for its label *and* its
             // arrow, or the two overlap the moment the label fills the cell.
             let width = size.width + h_pad + if self.is_sortable(&cell) { SORT_ZONE + SORT_GAP } else { 0.0 };
@@ -1692,12 +1688,12 @@ where
 
             for column in 0..columns {
                 let index = self.cell_index(row, column);
-                let node = self.elements[index].as_widget_mut().layout(
+                self.elements[index].as_widget_mut().layout(
                     &mut tree.children[index],
                     renderer,
                     &loose,
                 );
-                let size = node.size();
+                let size = tree.children[index].size;
 
                 intrinsic[column] = intrinsic[column].max(size.width + h_pad);
                 row_height = row_height.max(size.height + v_pad);
@@ -1753,7 +1749,7 @@ where
         // and does not depend on the final widths, so narrowing the columns
         // cannot change whether the bar was needed.
         let reserved = if self.vertical == Policy::Auto
-            && body_height > (limits.max().height - header_height).max(0.0)
+            && body_height > (limits.bounds().height - header_height).max(0.0)
         {
             self.scrollbar_width
         } else {
@@ -1763,7 +1759,7 @@ where
         // The gutter is carved out of the available width next, then folded
         // into every column offset. Doing it here means nothing downstream --
         // hit tests, dividers, column bands -- needs to know it exists.
-        let available = (limits.max().width - self.gutter * 2.0 - reserved).max(0.0);
+        let available = (limits.bounds().width - self.gutter * 2.0 - reserved).max(0.0);
         let widths =
             sizing::resolve_widths(&sizing, &intrinsic, available, self.spacing, self.overflow);
         let offsets: Vec<f32> = sizing::offsets(&widths, self.spacing)
@@ -1781,8 +1777,6 @@ where
         // reusing pass 1 because text wrapping (and so height) depends on the
         // final width.
         // ------------------------------------------------------------------
-        let mut nodes: Vec<layout::Node> = Vec::with_capacity(self.elements.len());
-        nodes.resize_with(self.elements.len(), || layout::Node::new(Size::ZERO));
 
         for i in 0..self.header_cells.len() {
             let cell = self.header_cells[i];
@@ -1794,22 +1788,24 @@ where
                 (height - v_pad).max(0.0),
             );
 
-            // `align` ADDS an offset; `move_to` SETS the position. Doing them
-            // the other way round silently discards the alignment, which is
-            // why everything rendered top-left regardless of what was asked
-            // for. Position first, then align within the cell.
-            nodes[cell.element] = self.elements[cell.element]
-                .as_widget_mut()
-                .layout(
-                    &mut tree.children[cell.element],
-                    renderer,
-                    &layout::Limits::new(Size::ZERO, inner),
-                )
-                .move_to(Point::new(
+            // `place` positions the cell, then ADDS the alignment offset
+            // within it. Doing them the other way round silently discards the
+            // alignment, which is why everything once rendered top-left
+            // regardless of what was asked for.
+            let child = &mut tree.children[cell.element];
+
+            self.elements[cell.element].as_widget_mut().layout(
+                child,
+                renderer,
+                &layout::Limits::new(Size::ZERO, inner),
+            );
+
+            place(
+                child,
+                Point::new(
                     offsets[cell.start] + self.padding.left,
                     header_row_height * cell.row as f32 + self.padding.top,
-                ))
-                .align(
+                ),
                     if cell.is_leaf() {
                         // A leaf header labels one column, so it should sit
                         // over that column the way the data does.
@@ -1828,8 +1824,8 @@ where
                     } else {
                         alignment::Alignment::Center
                     },
-                    inner,
-                );
+                inner,
+            );
         }
 
         for row in 0..self.row_count {
@@ -1842,22 +1838,21 @@ where
                     (row_height - v_pad).max(0.0),
                 );
 
-                nodes[index] = self.elements[index]
-                    .as_widget_mut()
-                    .layout(
-                        &mut tree.children[index],
-                        renderer,
-                        &layout::Limits::new(Size::ZERO, inner),
-                    )
-                    .move_to(Point::new(
-                        offsets[column] + self.padding.left,
-                        y + self.padding.top,
-                    ))
-                    .align(
-                        self.columns[column].align.into(),
-                        alignment::Alignment::Center,
-                        inner,
-                    );
+                let child = &mut tree.children[index];
+
+                self.elements[index].as_widget_mut().layout(
+                    child,
+                    renderer,
+                    &layout::Limits::new(Size::ZERO, inner),
+                );
+
+                place(
+                    child,
+                    Point::new(offsets[column] + self.padding.left, y + self.padding.top),
+                    self.columns[column].align.into(),
+                    alignment::Alignment::Center,
+                    inner,
+                );
             }
         }
 
@@ -1903,7 +1898,7 @@ where
         let viewport = Size::new(size.width, (size.height - header_height - bar).max(0.0));
         state.offset = scroll::clamp_offset(state.offset, viewport, state.content);
 
-        layout::Node::with_children(size, nodes)
+        tree.size = size;
     }
 
     fn draw(
@@ -1912,7 +1907,7 @@ where
         renderer: &mut Renderer,
         theme: &Theme,
         style: &renderer::Style,
-        layout: Layout<'_>,
+        layout: Layout,
         cursor: mouse::Cursor,
         viewport: &Rectangle,
     ) {
@@ -2311,7 +2306,7 @@ where
                             renderer,
                             theme,
                             &child_style,
-                            layout.child(index),
+                            cell_layout(layout, &tree.children[index]),
                             body_cursor,
                             &body_viewport,
                         );
@@ -2589,7 +2584,7 @@ where
                         } else {
                             &group_style
                         },
-                        layout.child(cell.element),
+                        cell_layout(layout, &tree.children[cell.element]),
                         header_cursor,
                         &header_viewport,
                     );
@@ -2778,7 +2773,7 @@ where
                                 renderer,
                                 theme,
                                 &header_style,
-                                layout.child(cell.element),
+                                cell_layout(layout, &tree.children[cell.element]),
                                 mouse::Cursor::Unavailable,
                                 // Untranslated: children cull against their own
                                 // layout coordinates, which the translation has
@@ -2819,7 +2814,7 @@ where
         &mut self,
         tree: &mut Tree,
         event: &Event,
-        layout: Layout<'_>,
+        layout: Layout,
         cursor: mouse::Cursor,
         renderer: &Renderer,
         shell: &mut Shell<'_, Message>,
@@ -3108,10 +3103,12 @@ where
                 (body_cursor, body_viewport)
             };
 
+            let child_layout = cell_layout(layout, &tree.children[index]);
+
             self.elements[index].as_widget_mut().update(
                 &mut tree.children[index],
                 event,
-                layout.child(index),
+                child_layout,
                 child_cursor,
                 renderer,
                 shell,
@@ -3599,7 +3596,7 @@ where
     fn mouse_interaction(
         &self,
         tree: &Tree,
-        layout: Layout<'_>,
+        layout: Layout,
         cursor: mouse::Cursor,
         _viewport: &Rectangle,
         renderer: &Renderer,
@@ -3690,7 +3687,7 @@ where
 
                 self.elements[index].as_widget().mouse_interaction(
                     &tree.children[index],
-                    layout.child(index),
+                    cell_layout(layout, &tree.children[index]),
                     child_cursor,
                     &bounds,
                     renderer,
@@ -3703,20 +3700,24 @@ where
     fn operate(
         &mut self,
         tree: &mut Tree,
-        layout: Layout<'_>,
+        layout: Layout,
+        viewport: &Rectangle,
         renderer: &Renderer,
         operation: &mut dyn Operation,
     ) {
         // On master, `container` only reports this widget's own bounds; child
         // traversal is a separate `traverse` call. Same split the built-in
         // container widget uses.
-        operation.container(None, layout.bounds());
+        operation.container(None, layout.bounds(), viewport);
 
         operation.traverse(&mut |operation| {
             for index in 0..self.elements.len() {
+                let child_layout = cell_layout(layout, &tree.children[index]);
+
                 self.elements[index].as_widget_mut().operate(
                     &mut tree.children[index],
-                    layout.child(index),
+                    child_layout,
+                    viewport,
                     renderer,
                     operation,
                 );
@@ -3727,11 +3728,12 @@ where
     fn overlay<'b>(
         &'b mut self,
         tree: &'b mut Tree,
-        layout: Layout<'b>,
+        layout: Layout,
         renderer: &Renderer,
         viewport: &Rectangle,
         translation: Vector,
-    ) -> Option<iced::advanced::overlay::Element<'b, Message, Theme, Renderer>> {
+        window: Size,
+    ) -> Vec<iced::advanced::overlay::Element<'b, Message, Theme, Renderer>> {
         let (offset, row_height, header_height) = {
             let state = tree.state.downcast_ref::<State>();
             (state.offset, state.row_height, state.header_height)
@@ -3760,27 +3762,59 @@ where
 
         let body = visible.start - header_len..visible.end - header_len;
 
-        let children: Vec<_> = header_elements
+        header_elements
             .iter_mut()
             .zip(header_trees)
-            .zip(layout.children())
             .chain(
                 body_elements[body.clone()]
                     .iter_mut()
-                    .zip(&mut body_trees[body])
-                    .zip(layout.children().skip(visible.start)),
+                    .zip(&mut body_trees[body]),
             )
-            .filter_map(|((child, state), layout)| {
-                child
-                    .as_widget_mut()
-                    .overlay(state, layout, renderer, viewport, translation)
-            })
-            .collect();
+            .flat_map(|(child, state)| {
+                let child_layout = cell_layout(layout, state);
 
-        (!children.is_empty())
-            .then(|| iced::advanced::overlay::Group::with_children(children).overlay())
+                child.as_widget_mut().overlay(
+                    state,
+                    child_layout,
+                    renderer,
+                    viewport,
+                    translation,
+                    window,
+                )
+            })
+            .collect()
     }
 }
+
+/// Returns the [`Layout`] of a cell, from the tree it was laid out in.
+///
+/// Built straight from the cell's tree rather than by walking
+/// [`Layout::iter`] to it, which would make every lookup linear in the number
+/// of cells before it.
+fn cell_layout(layout: Layout, cell: &Tree) -> Layout {
+    Layout::new(cell.size).move_to(layout.position() + cell.translation)
+}
+
+/// Moves a laid-out `cell` to `position`, then aligns it within `space`.
+fn place(
+    cell: &mut Tree,
+    position: Point,
+    align_x: alignment::Alignment,
+    align_y: alignment::Alignment,
+    space: Size,
+) {
+    let offset = |alignment, free: f32| match alignment {
+        alignment::Alignment::Start => 0.0,
+        alignment::Alignment::Center => free / 2.0,
+        alignment::Alignment::End => free,
+    };
+
+    cell.translation = Vector::new(
+        position.x + offset(align_x, space.width - cell.size.width),
+        position.y + offset(align_y, space.height - cell.size.height),
+    );
+}
+
 
 impl<'a, Message, Theme, Renderer> From<DataTable<'a, Message, Theme, Renderer>>
     for Element<'a, Message, Theme, Renderer>
