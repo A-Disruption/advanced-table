@@ -41,6 +41,7 @@ use iced::advanced::widget::{tree, Operation, Tree};
 use iced::advanced::{Shell, Widget};
 use std::collections::BTreeSet;
 use iced::border::Radius;
+use iced::Widget as _;
 use iced::{
     alignment, keyboard, mouse, touch, Background, Border, Color, Element, Event, Length, Padding,
     Point, Rectangle, Size, Vector,
@@ -352,7 +353,7 @@ where
         }
 
         for _ in count..self.columns.len() {
-            self.elements.push(iced::widget::Space::new().into());
+            self.elements.push(iced::widget::Space::new().boxed());
         }
 
         self.row_count += 1;
@@ -1640,11 +1641,7 @@ where
 
         for i in 0..self.header_cells.len() {
             let cell = self.header_cells[i];
-            self.elements[cell.element].as_widget_mut().layout(
-                &mut tree.children[cell.element],
-                renderer,
-                &loose,
-            );
+            self.elements[cell.element].layout(&mut tree.children[cell.element], renderer, &loose);
             let size = tree.children[cell.element].size;
             // A sortable column has to be wide enough for its label *and* its
             // arrow, or the two overlap the moment the label fills the cell.
@@ -1688,11 +1685,7 @@ where
 
             for column in 0..columns {
                 let index = self.cell_index(row, column);
-                self.elements[index].as_widget_mut().layout(
-                    &mut tree.children[index],
-                    renderer,
-                    &loose,
-                );
+                self.elements[index].layout(&mut tree.children[index], renderer, &loose);
                 let size = tree.children[index].size;
 
                 intrinsic[column] = intrinsic[column].max(size.width + h_pad);
@@ -1794,7 +1787,7 @@ where
             // regardless of what was asked for.
             let child = &mut tree.children[cell.element];
 
-            self.elements[cell.element].as_widget_mut().layout(
+            self.elements[cell.element].layout(
                 child,
                 renderer,
                 &layout::Limits::new(Size::ZERO, inner),
@@ -1840,7 +1833,7 @@ where
 
                 let child = &mut tree.children[index];
 
-                self.elements[index].as_widget_mut().layout(
+                self.elements[index].layout(
                     child,
                     renderer,
                     &layout::Limits::new(Size::ZERO, inner),
@@ -2301,7 +2294,7 @@ where
                             None => body_style,
                         };
 
-                        self.elements[index].as_widget().draw(
+                        self.elements[index].draw(
                             &tree.children[index],
                             renderer,
                             theme,
@@ -2575,7 +2568,7 @@ where
                     .iter()
                     .filter(|cell| cell.start >= range.start && cell.end < range.end)
                 {
-                    self.elements[cell.element].as_widget().draw(
+                    self.elements[cell.element].draw(
                         &tree.children[cell.element],
                         renderer,
                         theme,
@@ -2768,7 +2761,7 @@ where
                     renderer.with_translation(
                         Vector::new(chip.x - band.x, chip.y - band.y),
                         |renderer| {
-                            self.elements[cell.element].as_widget().draw(
+                            self.elements[cell.element].draw(
                                 &tree.children[cell.element],
                                 renderer,
                                 theme,
@@ -3105,7 +3098,7 @@ where
 
             let child_layout = cell_layout(layout, &tree.children[index]);
 
-            self.elements[index].as_widget_mut().update(
+            self.elements[index].update(
                 &mut tree.children[index],
                 event,
                 child_layout,
@@ -3685,7 +3678,7 @@ where
                     body_cursor
                 };
 
-                self.elements[index].as_widget().mouse_interaction(
+                self.elements[index].mouse_interaction(
                     &tree.children[index],
                     cell_layout(layout, &tree.children[index]),
                     child_cursor,
@@ -3714,7 +3707,7 @@ where
             for index in 0..self.elements.len() {
                 let child_layout = cell_layout(layout, &tree.children[index]);
 
-                self.elements[index].as_widget_mut().operate(
+                self.elements[index].operate(
                     &mut tree.children[index],
                     child_layout,
                     viewport,
@@ -3773,14 +3766,7 @@ where
             .flat_map(|(child, state)| {
                 let child_layout = cell_layout(layout, state);
 
-                child.as_widget_mut().overlay(
-                    state,
-                    child_layout,
-                    renderer,
-                    viewport,
-                    translation,
-                    window,
-                )
+                child.overlay(state, child_layout, renderer, viewport, translation, window)
             })
             .collect()
     }
@@ -3815,17 +3801,12 @@ fn place(
     );
 }
 
-
-impl<'a, Message, Theme, Renderer> From<DataTable<'a, Message, Theme, Renderer>>
-    for Element<'a, Message, Theme, Renderer>
+impl<'a, Message, Theme, Renderer> iced::advanced::widget::Meta
+    for DataTable<'a, Message, Theme, Renderer>
 where
-    Message: 'a,
-    Theme: Catalog + 'a,
-    Renderer: renderer::Renderer + 'a,
+    Theme: Catalog,
+    Renderer: renderer::Renderer,
 {
-    fn from(table: DataTable<'a, Message, Theme, Renderer>) -> Self {
-        Element::new(table)
-    }
 }
 
 #[cfg(test)]
@@ -3844,7 +3825,7 @@ mod tests {
         let mut table = DataTable::new(headers);
 
         for _ in 0..ROWS {
-            table.push((0..COLUMNS).map(|_| iced::widget::Space::new().into()));
+            table.push((0..COLUMNS).map(|_| iced::widget::Space::new().boxed()));
         }
 
         table

@@ -4,8 +4,10 @@
 //! presentation only -- the leaves are the real columns, and they own sizing,
 //! ordering, and eventually sort/resize state.
 
+use iced::advanced::Widget;
 use iced::alignment;
 use iced::Element;
+use iced::Widget as _;
 
 use crate::sizing::Sizing;
 
@@ -60,10 +62,10 @@ pub(crate) enum NodeKind<'a, Message, Theme, Renderer> {
 
 /// A leaf header -- one real column.
 pub fn leaf<'a, Message, Theme, Renderer>(
-    content: impl Into<Element<'a, Message, Theme, Renderer>>,
+    content: impl Widget<Message, Theme, Renderer> + 'a,
 ) -> HeaderNode<'a, Message, Theme, Renderer> {
     HeaderNode {
-        content: content.into(),
+        content: content.boxed(),
         kind: NodeKind::Leaf(ColumnSpec::default()),
         sticky: false,
     }
@@ -71,11 +73,11 @@ pub fn leaf<'a, Message, Theme, Renderer>(
 
 /// A group header spanning the columns beneath it.
 pub fn group<'a, Message, Theme, Renderer>(
-    content: impl Into<Element<'a, Message, Theme, Renderer>>,
+    content: impl Widget<Message, Theme, Renderer> + 'a,
     children: impl IntoIterator<Item = HeaderNode<'a, Message, Theme, Renderer>>,
 ) -> HeaderNode<'a, Message, Theme, Renderer> {
     HeaderNode {
-        content: content.into(),
+        content: content.boxed(),
         kind: NodeKind::Group(children.into_iter().collect()),
         sticky: false,
     }

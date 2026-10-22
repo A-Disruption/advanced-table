@@ -7,6 +7,7 @@ use advanced_table::{
     group, leaf, CellPosition, CellStyle, Click, DataTable, Direction, Overflow, Policy,
     SelectionMode, Sizing, Sort,
 };
+use iced::Widget as _;
 
 use std::collections::BTreeSet;
 
@@ -578,19 +579,19 @@ impl Demo {
 
         let mut table = DataTable::new(headers)
             .rows(&self.records, |record, column| match order[column] {
-                0 => text(record.id).into(),
-                1 => text(record.first).into(),
-                2 => text(record.last).into(),
-                3 => text(format!("${}", record.q3_revenue)).into(),
-                4 => text(format!("${}", record.q3_cost)).into(),
-                5 => text(format!("${}", record.q4_revenue)).into(),
-                6 => text(format!("${}", record.q4_cost)).into(),
+                0 => text(record.id).boxed(),
+                1 => text(record.first).boxed(),
+                2 => text(record.last).boxed(),
+                3 => text(format!("${}", record.q3_revenue)).boxed(),
+                4 => text(format!("${}", record.q3_cost)).boxed(),
+                5 => text(format!("${}", record.q4_revenue)).boxed(),
+                6 => text(format!("${}", record.q4_cost)).boxed(),
                 // An interactive cell. Clicking this while scrolled is the
                 // only way to confirm the cursor translation is right.
                 _ => button(text("Open").size(12))
                     .padding([2, 8])
                     .on_press(Message::Open(record.id))
-                    .into(),
+                    .boxed(),
             })
             .selection(
                 SelectionMode::Multiple,
@@ -683,7 +684,7 @@ impl Demo {
         .spacing(10)
         .padding(16)
         .height(Fill)
-        .into()
+        .boxed()
     }
 }
 

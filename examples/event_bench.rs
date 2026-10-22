@@ -15,6 +15,7 @@
 //! timed alongside it as a control, because `draw` already culls to the visible
 //! row range and so should stay flat while the others climb.
 
+use iced::Widget as _;
 use std::time::{Duration, Instant};
 
 use advanced_table::{data_table, leaf};
@@ -121,10 +122,10 @@ fn table(data: &[Row]) -> iced::Element<'_, (), iced::Theme, ()> {
         .collect();
 
     data_table(headers)
-        .rows(data, |row: &Row, column| text(&row.cells[column]).into())
+        .rows(data, |row: &Row, column| text(&row.cells[column]).boxed())
         .width(Length::Fill)
         .height(Length::Fill)
-        .into()
+        .boxed()
 }
 
 fn update(
